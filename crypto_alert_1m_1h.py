@@ -52,4 +52,5 @@ def get_bybit_data():
 
 
 def check_changes():
-    """Controlla variazioni di
+    """Controlla variazioni di prezzo su Binance"""
+
