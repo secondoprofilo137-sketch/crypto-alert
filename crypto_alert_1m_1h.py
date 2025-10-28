@@ -1,8 +1,11 @@
+
 import time
 import requests
 import datetime
 import os
 import json
+import threading
+from flask import Flask
 
 # === CONFIGURAZIONE TELEGRAM ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -157,11 +160,29 @@ def check_changes():
 
 
 # ==================================================
+# 🔹 FLASK PER RENDER
+# ==================================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Crypto Alert Bot è attivo su Render!"
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+
+# ==================================================
 # 🔹 LOOP PRINCIPALE
 # ==================================================
 if __name__ == "__main__":
     print("🚀 Bot avviato (Bybit Derivatives) – monitoraggio 1m, 2m, 5m attivo...")
     load_state_from_gist()
+
+    # Avvia Flask in un thread separato
+    threading.Thread(target=run_flask, daemon=True).start()
 
     while True:
         try:
