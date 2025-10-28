@@ -52,5 +52,42 @@ def get_bybit_data():
 
 
 def check_changes():
-    """Controlla variazioni di prezzo su Binance"""
+    """Controlla variazioni di prezzo su Bybit"""
+    data = get_bybit_data()
+    if not data:
+        print("⚠️ Nessun dato ricevuto da Bybit.")
+        return
 
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"🔍 Controllo alle {now} - {len(data)} coppie trovate")
+
+    for coin in data:
+        try:
+            last_price = float(coin.get("lastPrice", 0))
+            prev_price = float(coin.get("prevPrice24h", 0))
+            if prev_price == 0:
+                continue
+
+            change_percent = ((last_price - prev_price) / prev_price) * 100
+
+            if abs(change_percent) >= PRICE_CHANGE_THRESHOLD:
+                message = (
+                    f"🚨 {coin['symbol']} ha variazione del {change_percent:.2f}% nelle ultime 24h\n"
+                    f"Prezzo attuale: {last_price}\n"
+                    f"Prezzo 24h fa: {prev_price}"
+                )
+                print(message)
+                send_telegram_message(message)
+
+        except Exception as e:
+            print(f"Errore elaborando {coin.get('symbol')}: {e}")
+
+
+if __name__ == "__main__":
+    print("🚀 Bot avviato e in esecuzione continua...")
+    while True:
+        try:
+            check_changes()  # funzione principale che controlla le variazioni
+        except Exception as e:
+            print("⚠️ Errore nel ciclo principale:", e)
+        time.sleep(CHECK_INTERVAL)
