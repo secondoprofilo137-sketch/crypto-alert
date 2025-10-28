@@ -1,56 +1,55 @@
-def fetch_all_coins():
-    print("📦 Carico lista CoinGecko (solo alla prima esecuzione)...")
-    results = []
-    page = 1
-    max_retries = 3  # quante volte ritentare in caso di errore
+import time
+import requests
+import datetime
+import os
+import sys
 
-    while True:
-        params = {
-            "vs_currency": FIAT,
-            "order": "market_cap_desc",
-            "per_page": 250,
-            "page": page,
-            "price_change_percentage": "1h"
-        }
+# === CONFIGURAZIONE TELEGRAM ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-        for attempt in range(max_retries):
-            try:
-                r = requests.get(COINGECKO_URL, params=params, timeout=30)
-                if r.status_code == 429:
-                    wait_time = 10 + attempt * 5
-                    print(f"⏳ Troppi accessi (429), attendo {wait_time}s e ritento...")
-                    time.sleep(wait_time)
-                    continue
-                elif r.status_code != 200:
-                    print(f"⚠️ Errore API pagina {page}: {r.status_code}")
-                    time.sleep(5)
-                    continue
+# === CONFIGURAZIONE ALLERTA ===
+PRICE_CHANGE_THRESHOLD = 5  # variazione percentuale
+CHECK_INTERVAL = 60  # ogni 60 secondi
+MAX_RETRIES = 5  # per sicurezza, in caso di errore temporaneo
 
-                data = r.json()
-                if not data:
-                    print("✅ Fine elenco CoinGecko.")
-                    save_cache(results)
-                    print(f"✅ Cache salvata ({len(results)} monete totali).")
-                    return results
+# === BYBIT API (derivatives) ===
+BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 
-                results.extend(data)
-                print(f"📄 Pagina {page} scaricata ({len(results)} totali)...")
 
-                # Pausa per non essere bloccati
-                time.sleep(6)
-                page += 1
-                break
+def send_telegram_message(message: str):
+    """Invia un messaggio Telegram"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ Nessun token/chat Telegram configurato.")
+        return
 
-            except Exception as e:
-                print(f"⚠️ Errore connessione (pagina {page}, tentativo {attempt+1}/{max_retries}): {e}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        if r.status_code != 200:
+            print("❌ Errore invio Telegram:", r.text)
+    except Exception as e:
+        print("⚠️ Errore Telegram:", e)
+
+
+def get_bybit_data():
+    """Recupera tutti i dati delle coppie derivati da Bybit"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(BYBIT_URL, timeout=15)
+            if response.status_code == 429:
+                print(f"⏳ Troppi accessi (429), attendo 10s e ritento ({attempt+1}/{MAX_RETRIES})...")
                 time.sleep(10)
+                continue
+            response.raise_for_status()
+            return response.json().get("result", {}).get("list", [])
+        except Exception as e:
+            print(f"⚠️ Errore connessione Bybit ({attempt+1}/{MAX_RETRIES}):", e)
+            time.sleep(5)
+    return []
 
-        else:
-            # Se tutti i retry falliscono, esci
-            print(f"❌ Impossibile scaricare la pagina {page} dopo {max_retries} tentativi.")
-            break
 
-    save_cache(results)
-    print(f"✅ Cache salvata ({len(results)} monete totali).")
-    return results
-
+def check_changes():
+    """Controlla variazioni di
