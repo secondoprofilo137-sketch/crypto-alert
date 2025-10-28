@@ -8,45 +8,80 @@ import json
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# === CONFIGURAZIONE ALLERTA ===
-PRICE_CHANGE_THRESHOLD = 5   # variazione percentuale per segnalazione
-CHECK_INTERVAL = 60          # controllo ogni 60 secondi
-MAX_RETRIES = 5              # retry in caso di errore API
+# === CONFIGURAZIONE GIST (per salvataggio remoto) ===
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GIST_ID = os.getenv("GIST_ID")
 
-# === BYBIT API (derivatives) ===
+# === CONFIGURAZIONE ALLERTA ===
+PRICE_CHANGE_THRESHOLD = 5  # variazione percentuale
+CHECK_INTERVAL = 60  # ogni 60 secondi
+MAX_RETRIES = 5  # numero massimo di retry in caso di errore
+
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 
-# === FILE DI STATO ===
-STATE_FILE = "/data/state.json"
-
-# === MEMORIA ===
+# === Stato in memoria ===
 last_prices = {}
 last_alerts = {}
 
-# === FUNZIONI DI STATO ===
-def load_state():
-    """Carica stato precedente da file JSON"""
+
+# ==================================================
+# 🔹 FUNZIONI DI SUPPORTO GIST
+# ==================================================
+def load_state_from_gist():
+    """Scarica lo stato (last_prices, last_alerts) da GitHub Gist."""
     global last_prices, last_alerts
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                last_prices = data.get("last_prices", {})
-                last_alerts = data.get("last_alerts", {})
-                print(f"✅ Stato caricato: {len(last_prices)} prezzi e {len(last_alerts)} alert memorizzati.")
-        except Exception as e:
-            print(f⚠️ Errore caricamento stato: {e}")
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("⚠️ Nessun token GitHub o Gist ID configurato. Uso stato locale in RAM.")
+        return
 
-def save_state():
-    """Salva stato corrente su file JSON"""
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({"last_prices": last_prices, "last_alerts": last_alerts}, f)
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        gist_data = response.json()
+        content = gist_data["files"]["state.json"]["content"]
+        data = json.loads(content)
+
+        last_prices = data.get("last_prices", {})
+        last_alerts = data.get("last_alerts", {})
+        print("✅ Stato caricato da Gist con successo.")
+
     except Exception as e:
-        print(f"⚠️ Errore salvataggio stato: {e}")
+        print("⚠️ Errore nel caricamento da Gist:", e)
 
 
-# === FUNZIONE TELEGRAM ===
+def save_state_to_gist():
+    """Salva lo stato (last_prices, last_alerts) su GitHub Gist."""
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("⚠️ Nessun token GitHub o Gist ID configurato. Stato non salvato.")
+        return
+
+    try:
+        data = {
+            "last_prices": last_prices,
+            "last_alerts": last_alerts
+        }
+        payload = {
+            "files": {
+                "state.json": {"content": json.dumps(data, indent=2)}
+            }
+        }
+
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        response = requests.patch(url, headers=headers, json=payload)
+        response.raise_for_status()
+        print("💾 Stato salvato su Gist con successo.")
+
+    except Exception as e:
+        print("⚠️ Errore nel salvataggio su Gist:", e)
+
+
+# ==================================================
+# 🔹 FUNZIONI PRINCIPALI
+# ==================================================
 def send_telegram_message(message: str):
     """Invia un messaggio Telegram"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -64,7 +99,6 @@ def send_telegram_message(message: str):
         print("⚠️ Errore Telegram:", e)
 
 
-# === FUNZIONE API BYBIT ===
 def get_bybit_data():
     """Recupera tutti i dati delle coppie derivati da Bybit"""
     for attempt in range(MAX_RETRIES):
@@ -82,71 +116,53 @@ def get_bybit_data():
     return []
 
 
-# === FUNZIONE PRINCIPALE ===
 def check_changes():
-    """Controlla variazioni di prezzo su Bybit Derivatives ogni minuto e su 24h"""
+    """Controlla variazioni di prezzo su 1m, 2m e 5m"""
     global last_prices, last_alerts
 
     data = get_bybit_data()
-    if not data:
-        print("⚠️ Nessun dato ricevuto da Bybit.")
-        return
-
-    now = datetime.datetime.now().strftime("%H:%M:%S")
-    alerts_sent = 0
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     for coin in data:
-        try:
-            symbol = coin["symbol"]
-            last_price = float(coin.get("lastPrice", 0))
-            prev_price_24h = float(coin.get("prevPrice24h", 0))
-            if last_price == 0 or prev_price_24h == 0:
-                continue
+        symbol = coin.get("symbol")
+        price = float(coin.get("lastPrice", 0))
+        if not symbol or price == 0:
+            continue
 
-            # === 1️⃣ Variazione su 1 minuto ===
-            prev_price_1m = last_prices.get(symbol)
-            if prev_price_1m:
-                change_1m = ((last_price - prev_price_1m) / prev_price_1m) * 100
-                if abs(change_1m) >= PRICE_CHANGE_THRESHOLD:
-                    if symbol not in last_alerts or abs((last_price - last_alerts[symbol]) / last_alerts[symbol]) > 0.01:
-                        direction = "📈 AUMENTO" if change_1m > 0 else "📉 CALO"
-                        msg = (
-                            f"{direction} {symbol} (1m)\n"
-                            f"Variazione: {change_1m:.2f}%\n"
-                            f"Prezzo attuale: {last_price:.4f} USDT"
-                        )
-                        send_telegram_message(msg)
-                        last_alerts[symbol] = last_price
-                        alerts_sent += 1
+        if symbol not in last_prices:
+            last_prices[symbol] = {
+                "1m": {"price": price, "timestamp": time.time()},
+                "2m": {"price": price, "timestamp": time.time()},
+                "5m": {"price": price, "timestamp": time.time()}
+            }
+            continue
 
-            # === 2️⃣ Variazione su 24h ===
-            change_24h = ((last_price - prev_price_24h) / prev_price_24h) * 100
-            if abs(change_24h) >= PRICE_CHANGE_THRESHOLD:
-                if symbol not in last_alerts or abs((last_price - last_alerts[symbol]) / last_alerts[symbol]) > 0.01:
-                    direction = "📈 AUMENTO" if change_24h > 0 else "📉 CALO"
-                    msg = (
-                        f"{direction} {symbol} (24h)\n"
-                        f"Variazione: {change_24h:.2f}%\n"
-                        f"Prezzo attuale: {last_price:.4f} USDT"
-                    )
+        alerts_to_check = [("1m", 60), ("2m", 120), ("5m", 300)]
+        for label, period in alerts_to_check:
+            prev_price = last_prices[symbol][label]["price"]
+            prev_time = last_prices[symbol][label]["timestamp"]
+
+            if time.time() - prev_time >= period:
+                change = ((price - prev_price) / prev_price) * 100
+                if abs(change) >= PRICE_CHANGE_THRESHOLD:
+                    icons = {"1m": "🔥", "2m": "⚡", "5m": "🚀"}
+                    icon = icons[label]
+                    msg = f"{icon} {symbol} ha variazioni del {change:.2f}% negli ultimi {label}! ({now})"
+                    print(msg)
                     send_telegram_message(msg)
-                    last_alerts[symbol] = last_price
-                    alerts_sent += 1
 
-            last_prices[symbol] = last_price
+                last_prices[symbol][label] = {"price": price, "timestamp": time.time()}
 
-        except Exception as e:
-            print(f"⚠️ Errore su {coin.get('symbol')}: {e}")
-
-    # Salva lo stato dopo ogni ciclo
-    save_state()
-    print(f"✅ [{now}] Controllo completato - {alerts_sent} nuovi alert inviati.")
+    save_state_to_gist()
 
 
-# === LOOP PRINCIPALE ===
+# ==================================================
+# 🔹 LOOP PRINCIPALE
+# ==================================================
 if __name__ == "__main__":
-    print("🚀 Bot avviato e in esecuzione continua...")
-    load_state()
+    print("🚀 Bot avviato (Bybit Derivatives) – monitoraggio 1m, 2m, 5m attivo...")
+    load_state_from_gist()
+
     while True:
         try:
             check_changes()
