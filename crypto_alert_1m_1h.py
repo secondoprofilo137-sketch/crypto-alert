@@ -138,4 +138,5 @@ if __name__ == "__main__":
     print("🚀 Advanced Crypto Alert Bot starting (secure version, env vars)")
     load_state_from_gist()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000))), daemon=True).start()
-    monitor_start()
+    start_monitoring()
+
