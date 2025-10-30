@@ -1,2 +1,2 @@
 #!/bin/bash
-python monitor_service.py
+python monitor_bybit_flask.py
