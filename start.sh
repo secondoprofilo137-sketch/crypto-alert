@@ -1,3 +1,4 @@
 #!/bin/bash
-python crypto_alert_1m_1h.py
+monitor_bybit_all_1m_3m_1h.py
+
 
