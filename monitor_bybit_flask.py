@@ -2,6 +2,7 @@
 # monitor_bybit_flask.py
 # Bybit derivatives monitor — 1m, 3m, 1h — Flask + background monitor
 # Italiano, suggerimenti, emoji, timezone-aware datetimes
+# Versione: unisce la logica precedente (funzionante) con i nuovi suggerimenti condizionati.
 
 import os
 import time
@@ -16,17 +17,24 @@ from flask import Flask
 # -------------------------
 # CONFIG (env or defaults)
 # -------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # token bot
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")          # chat id
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # token bot (env)
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")          # chat id (env)
 PORT = int(os.getenv("PORT", 10000))
 
 FAST_TFS = os.getenv("FAST_TFS", "1m,3m").split(",")
 SLOW_TFS = os.getenv("SLOW_TFS", "1h").split(",")
-FAST_THRESHOLD = float(os.getenv("FAST_THRESHOLD", 5.0))
-SLOW_THRESHOLD = float(os.getenv("SLOW_THRESHOLD", 3.0))
-LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))  # sec between cycles
+FAST_THRESHOLD = float(os.getenv("FAST_THRESHOLD", 5.0))    # alert generico
+SLOW_THRESHOLD = float(os.getenv("SLOW_THRESHOLD", 3.0))    # alert 1h generico
+LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))               # sec between cycles
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", 3600))  # 1h
-MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))  # limit per cycle
+MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))
+
+# -----------------------------------------------------------
+# Nuove soglie per INVIO DEI SUGGERIMENTI (come richiesto)
+# invia i consigli operativi SOLO se la variazione è forte:
+SUGGESTION_FAST_THRESHOLD = float(os.getenv("SUGGESTION_FAST_THRESHOLD", 10.0))  # % per 1m/3m
+SUGGESTION_SLOW_THRESHOLD = float(os.getenv("SUGGESTION_SLOW_THRESHOLD", 6.0))   # % per 1h
+# -----------------------------------------------------------
 
 # risk tiers (very simple mapping)
 VOL_TIER_THRESHOLDS = {"low": 0.002, "medium": 0.006, "high": 0.012}
@@ -65,7 +73,7 @@ def test_alert():
     return "Test sent", 200
 
 # -------------------------
-# Telegram helper
+# Telegram helper (debuggable)
 # -------------------------
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -79,6 +87,8 @@ def send_telegram(text: str):
         if r.status_code != 200:
             print("❌ Errore Telegram", r.status_code, r.text)
             return False
+        # piccolo log utile per debug in Render
+        print(f"✅ Telegram OK ({len(text)} chars)")
         return True
     except Exception as e:
         print("❌ Exception Telegram:", e)
@@ -141,7 +151,7 @@ def estimate_risk_and_suggestion(closes, volumes):
     mapping = RISK_MAPPING.get(tier, RISK_MAPPING["medium"])
     vol_ratio = 1.0
     if volumes and len(volumes) >= 2:
-        baseline = mean(volumes[-6:-1]) if len(volumes) >= 6 else mean(volumes[:-1])
+        baseline = mean(volumes[-6:-1]) if len(volumes) >= 6 else mean(volumes[:-1]) if len(volumes) > 1 else 1.0
         last_vol = volumes[-1]
         if baseline and baseline > 0:
             vol_ratio = last_vol / baseline
@@ -149,7 +159,8 @@ def estimate_risk_and_suggestion(closes, volumes):
         f"Categoria volatilità: {tier.upper()} | Leva suggerita: {mapping['leverage']}\n"
         f"Target indicativi: +{mapping['target_pct'][0]:.1f}% → +{mapping['target_pct'][1]:.1f}% | "
         f"Stop indicativi: {mapping['stop_pct'][0]:.1f}% → {mapping['stop_pct'][1]:.1f}%\n"
-        f"Vol ratio: {vol_ratio:.2f}× | Volatility: {vol:.4f}"
+        f"Vol ratio: {vol_ratio:.2f}× | Volatility: {vol:.4f}\n"
+        "⚠️ Nota: suggerimenti informativi, non sono consulenza finanziaria."
     )
     return mapping, suggestion
 
@@ -163,6 +174,8 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=60):
         volumes = [c[5] if len(c) > 5 else 0.0 for c in ohlcv]
         return closes, volumes
     except Exception as e:
+        # log solo in console per non riempire telegram
+        print(f"⚠️ safe_fetch_ohlcv {symbol} {timeframe}: {e}")
         return None, None
 
 # -------------------------
@@ -173,15 +186,13 @@ def get_bybit_derivative_symbols():
         markets = exchange.load_markets()
         syms = []
         for symbol, meta in markets.items():
-            # prefer explicit type check, fallback to symbol suffix check
-            mtype = meta.get("type") or meta.get("spot", None)
-            if meta.get("info", {}) and meta.get("info", {}).get("category"):
-                # some exchanges include category
-                if str(meta["info"].get("category")).lower() in ("linear", "swap", "derivative"):
-                    syms.append(symbol)
-                    continue
-            # fallback: type == 'swap' or symbol endswith ':USDT' etc.
-            if meta.get("type") == "swap" or symbol.endswith(":USDT") or ":USDT" in symbol:
+            # cerca swap/derivative in metadata o fallback su simbolo
+            info = meta.get("info", {}) or {}
+            cat = str(info.get("category", "")).lower() if info else ""
+            if cat in ("linear", "swap", "derivative"):
+                syms.append(symbol)
+                continue
+            if meta.get("type") == "swap" or ":USDT" in symbol or symbol.endswith(":USDT"):
                 syms.append(symbol)
         return list(sorted(set(syms)))
     except Exception as e:
@@ -195,18 +206,15 @@ def monitor_loop():
     global last_prices, last_alerts
     symbols = get_bybit_derivative_symbols()
     print(f"✅ Simboli derivati Bybit trovati: {len(symbols)}")
-    # last heartbeat
     last_heartbeat = 0
     while True:
         start = time.time()
         processed = 0
-        # iterate symbols but optionally limit per cycle
         for symbol in symbols[:MAX_CANDIDATES_PER_CYCLE]:
             processed += 1
-            # fast timeframes
+            # FAST timeframes (1m,3m)
             for tf in FAST_TFS:
-                # fetch last candle price
-                closes, volumes = safe_fetch_ohlcv(symbol, tf, limit=2)
+                closes, volumes = safe_fetch_ohlcv(symbol, tf, limit=60)
                 if not closes:
                     continue
                 price = closes[-1]
@@ -216,31 +224,29 @@ def monitor_loop():
                     variation = ((price - prev) / prev) * 100 if prev else 0.0
                 except Exception:
                     variation = 0.0
+
                 if abs(variation) >= FAST_THRESHOLD:
-                    # cooldown per symbol+type
                     cooldown = last_alerts.setdefault(symbol, {}).get(f"fast_{tf}", 0)
                     if time.time() - cooldown > max(60, LOOP_DELAY * 3):
-                        # get richer data for suggestion
-                        kl_closes, kl_vols = safe_fetch_ohlcv(symbol, tf, limit=60)
-                        mapping, suggestion = estimate_risk_and_suggestion(kl_closes or closes, kl_vols or volumes)
-                        trend = "rialzo" if variation > 0 else "crollo"
-                        emoji = "🔥"
-                        header = f"🔔 ALERT -> {emoji} {symbol} — variazione {variation:+.2f}% (ref {tf})"
-                        metrics = f"Prezzo attuale: {price:.6f}"
-                        interp = f"📊 { 'Rialzo' if variation>0 else 'Crollo' } rilevato — attenzione al trend."
+                        # decide se inviare solo alert o alert + suggerimento (solo se forte)
                         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                        text = f"{header}\n{metrics}\n{interp}\n{suggestion}\n[{now}]"
+                        header = f"🔔 ALERT -> 🔥 {symbol} — variazione {variation:+.2f}% (ref {tf})"
+                        metrics = f"Prezzo attuale: {price:.6f}"
+                        interp = ("📈 Rialzo rilevato" if variation > 0 else "📉 Crollo rilevato") + " — attenzione al trend."
+                        # suggerimento solo se cambiamento >= SUGGESTION_FAST_THRESHOLD
+                        suggestion_text = ""
+                        if abs(variation) >= SUGGESTION_FAST_THRESHOLD:
+                            mapping, suggestion_text = estimate_risk_and_suggestion(closes, volumes)
+                        text = "\n".join([header, metrics, interp, suggestion_text, f"[{now}]" if now else ""])
                         print(text)
                         send_telegram(text)
                         last_alerts[symbol][f"fast_{tf}"] = time.time()
                 # update last price
                 last_prices[f"{symbol}_{tf}"] = price
 
-            # slow timeframes (1h) run less often — compute but use a different cooldown
+            # SLOW timeframes (1h)
             for tf in SLOW_TFS:
-                if time.time() % HEARTBEAT_INTERVAL_SEC > LOOP_DELAY:  # heuristic: spread 1h runs
-                    pass
-                closes, volumes = safe_fetch_ohlcv(symbol, tf, limit=2)
+                closes, volumes = safe_fetch_ohlcv(symbol, tf, limit=120)
                 if not closes:
                     continue
                 price = closes[-1]
@@ -252,15 +258,15 @@ def monitor_loop():
                     variation = 0.0
                 if abs(variation) >= SLOW_THRESHOLD:
                     cooldown = last_alerts.setdefault(symbol, {}).get(f"slow_{tf}", 0)
-                    if time.time() - cooldown > max(1800, HEARTBEAT_INTERVAL_SEC/2):
-                        kl_closes, kl_vols = safe_fetch_ohlcv(symbol, tf, limit=120)
-                        mapping, suggestion = estimate_risk_and_suggestion(kl_closes or closes, kl_vols or volumes)
-                        emoji = "⚡"
-                        header = f"🔔 ALERT -> {emoji} {symbol} — variazione {variation:+.2f}% (ref {tf})"
-                        metrics = f"Prezzo attuale: {price:.6f}"
-                        interp = f"📈 Movimento medio-lungo rilevato."
+                    if time.time() - cooldown > max(1800, HEARTBEAT_INTERVAL_SEC / 2):
                         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                        text = f"{header}\n{metrics}\n{interp}\n{suggestion}\n[{now}]"
+                        header = f"🔔 ALERT -> ⚡ {symbol} — variazione {variation:+.2f}% (ref {tf})"
+                        metrics = f"Prezzo attuale: {price:.6f}"
+                        interp = "📈 Movimento medio-lungo rilevato."
+                        suggestion_text = ""
+                        if abs(variation) >= SUGGESTION_SLOW_THRESHOLD:
+                            mapping, suggestion_text = estimate_risk_and_suggestion(closes, volumes)
+                        text = "\n".join([header, metrics, interp, suggestion_text, f"[{now}]" if now else ""])
                         print(text)
                         send_telegram(text)
                         last_alerts[symbol][f"slow_{tf}"] = time.time()
@@ -283,10 +289,9 @@ def monitor_loop():
 # -------------------------
 if __name__ == "__main__":
     print(f"🚀 Bybit Derivatives monitor — timeframes {FAST_TFS} + {SLOW_TFS} — threshold fast {FAST_THRESHOLD}% / slow {SLOW_THRESHOLD}% — loop {LOOP_DELAY}s")
-    # start Flask app in a thread
+    # start Flask app in a thread (Render needs binding to PORT)
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
     # start monitor in background
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
-    # block main thread while background runs
     monitor_thread.join()
