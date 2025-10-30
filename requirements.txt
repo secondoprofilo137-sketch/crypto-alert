@@ -1,3 +1,4 @@
 ccxt==4.3.98
 requests==2.32.3
 python-dotenv==1.0.1
+Flask==3.1.2
