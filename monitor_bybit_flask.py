@@ -232,8 +232,11 @@ def monitor_loop():
 # Avvio
 # -------------------------
 if __name__ == "__main__":
-    print(f"🚀 Avvio monitor Bybit — timeframes {FAST_TFS + SLOW_TFS}, thresholds {FAST_THRESHOLD}/{SLOW_THRESHOLD}, loop {LOOP_DELAY}s")
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    while True:
-        time.sleep(60)
+    print(f"🚀 Avvio monitor Bybit — timeframes {FAST_TFS} + {SLOW_TFS}, thresholds {FAST_THRESHOLD}/{SLOW_THRESHOLD}, loop {LOOP_DELAY}s")
+
+    # Avvia il monitor in background
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+
+    # Avvia Flask dopo il monitor
+    app.run(host="0.0.0.0", port=PORT)
