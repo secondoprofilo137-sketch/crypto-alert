@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# monitor_bybit_flask_v2.py
-# Bybit Derivatives Monitor — Flask + Telegram — con rilevamento spike di volume
-# Versione 2 — italiano, emoji, suggerimenti e heartbeat orario
+# monitor_bybit_flask.py
+# Bybit Derivatives Monitor — Flask + Telegram — versione stabile senza spike
 
 import os
 import time
@@ -14,7 +13,7 @@ import ccxt
 from flask import Flask
 
 # -------------------------
-# CONFIG (env o defaults)
+# CONFIGURAZIONE BASE
 # -------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if cid.strip()]
@@ -23,7 +22,7 @@ PORT = int(os.getenv("PORT", 10000))
 FAST_TFS = os.getenv("FAST_TFS", "1m,3m").split(",")
 SLOW_TFS = os.getenv("SLOW_TFS", "1h").split(",")
 FAST_THRESHOLD = float(os.getenv("FAST_THRESHOLD", 5.0))
-SLOW_THRESHOLD = float(os.getenv("SLOW_THRESHOLD", 10.0))  # solo ≥10%
+SLOW_THRESHOLD = float(os.getenv("SLOW_THRESHOLD", 10.0))  # >= 10%
 LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", 3600))
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 800))
@@ -37,19 +36,18 @@ RISK_MAPPING = {
 }
 
 # -------------------------
-# Stato e inizializzazioni
+# Stato
 # -------------------------
 last_prices = {}
 last_alerts = {}
 _lock = threading.Lock()
 
 exchange = ccxt.bybit({"options": {"defaultType": "swap"}})
-
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Crypto Alert Bot (Bybit derivatives) — running v2"
+    return "✅ Crypto Alert Bot (Bybit derivatives) — running"
 
 @app.route("/test")
 def test_alert():
@@ -112,7 +110,7 @@ def estimate_risk_and_suggestion(closes, volumes):
     return mapping, suggestion
 
 # -------------------------
-# Fetch sicuro
+# Funzioni di supporto
 # -------------------------
 def safe_fetch_ohlcv(symbol, timeframe, limit=60):
     try:
@@ -123,9 +121,6 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=60):
     except Exception:
         return None, None
 
-# -------------------------
-# Filtraggio simboli derivati
-# -------------------------
 def get_bybit_derivative_symbols():
     try:
         markets = exchange.load_markets()
@@ -136,7 +131,7 @@ def get_bybit_derivative_symbols():
         return []
 
 # -------------------------
-# Loop principale
+# Monitor loop
 # -------------------------
 def monitor_loop():
     global last_prices, last_alerts
@@ -148,21 +143,6 @@ def monitor_loop():
         start = time.time()
 
         for symbol in symbols[:MAX_CANDIDATES_PER_CYCLE]:
-            # === Spike volume (ultima candela 1m)
-            closes, volumes = safe_fetch_ohlcv(symbol, "1m", limit=20)
-            if volumes and len(volumes) >= 11:
-                avg_prev = sum(volumes[-11:-1]) / 10
-                last_vol = volumes[-1]
-                if avg_prev > 0 and last_vol / avg_prev >= 3.0:
-                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    text = (
-                        f"🛗 *SPIKE DI VOLUME!*\n"
-                        f"{symbol} — volume attuale: {last_vol/avg_prev:.2f}× sopra la media (1m)\n"
-                        f"[{now}]"
-                    )
-                    print(text)
-                    send_telegram(text)
-
             # === Fast timeframe (1m, 3m)
             for tf in FAST_TFS:
                 closes, _ = safe_fetch_ohlcv(symbol, tf, limit=2)
@@ -191,7 +171,7 @@ def monitor_loop():
                         last_alerts[symbol][f"fast_{tf}"] = time.time()
                 last_prices[key] = price
 
-            # === Slow timeframe (1h) solo ≥10%
+            # === Slow timeframe (1h, >=10%)
             for tf in SLOW_TFS:
                 closes, _ = safe_fetch_ohlcv(symbol, tf, limit=2)
                 if not closes:
