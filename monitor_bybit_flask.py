@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Bybit monitor — versione stabile Render + cooldown + init fix
+# Bybit monitor — versione 3.0 con Trend Detector integrato
 
 import os
 import time
@@ -9,8 +9,10 @@ from statistics import mean, pstdev
 from datetime import datetime, timezone
 import requests
 import ccxt
+import numpy as np
 from flask import Flask
 
+# === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
 PORT = int(os.getenv("PORT", 10000))
@@ -41,6 +43,7 @@ last_prices = {}
 last_alert_time = {}
 app = Flask(__name__)
 
+# === TELEGRAM ===
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not CHAT_IDS:
         return
@@ -54,11 +57,12 @@ def send_telegram(message: str):
         except Exception as e:
             print("❌ Telegram error:", e)
 
+# === ANALYTICS ===
 def compute_volatility_logreturns(closes):
     if len(closes) < 3:
         return 0.0
     try:
-        lr = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
+        lr = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
         return pstdev(lr)
     except Exception:
         return 0.0
@@ -79,6 +83,46 @@ def estimate_risk_and_suggestion(closes, volumes):
         vol_ratio = last_vol / baseline if baseline else 1.0
     return f"📊 Volatilità: {tier.upper()} | Stop: {mapping['stop_pct'][0]:.1f}%→{mapping['stop_pct'][1]:.1f}% | Vol ratio: {vol_ratio:.2f}×"
 
+# === TREND DETECTOR ===
+def detect_structure(closes):
+    highs, lows = [], []
+    for i in range(2, len(closes) - 2):
+        if closes[i] > closes[i - 1] and closes[i] > closes[i + 1]:
+            highs.append((i, closes[i]))
+        if closes[i] < closes[i - 1] and closes[i] < closes[i + 1]:
+            lows.append((i, closes[i]))
+    if len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
+        return "higher_low"
+    if len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
+        return "lower_high"
+    return None
+
+def trendline_break(closes):
+    if len(closes) < 20:
+        return None
+    x = np.arange(len(closes))
+    slope, intercept = np.polyfit(x[-10:], closes[-10:], 1)
+    predicted = intercept + slope * x[-1]
+    current = closes[-1]
+    if current > predicted * 1.01:
+        return "break_up"
+    elif current < predicted * 0.99:
+        return "break_down"
+    return None
+
+def detect_trend_signal(closes, vols):
+    structure = detect_structure(closes)
+    break_signal = trendline_break(closes)
+    if not vols or len(vols) < 6:
+        return None
+    volume_ratio = vols[-1] / max(mean(vols[-6:-1]), 1)
+    if structure == "higher_low" and break_signal == "break_up" and volume_ratio > 1.5:
+        return f"📈 Trend RIALZISTA POTENZIALE — vol×{volume_ratio:.2f}"
+    elif structure == "lower_high" and break_signal == "break_down" and volume_ratio > 1.5:
+        return f"📉 Trend RIBASSISTA POTENZIALE — vol×{volume_ratio:.2f}"
+    return None
+
+# === EXCHANGE HELPERS ===
 def safe_fetch(symbol, tf, limit=60):
     try:
         data = exchange.fetch_ohlcv(symbol, tf, limit=limit)
@@ -105,6 +149,7 @@ def test():
     send_telegram(f"🧪 TEST OK — {now}")
     return "Telegram test inviato", 200
 
+# === MAIN MONITOR LOOP ===
 def monitor_loop():
     symbols = get_bybit_symbols()
     print(f"✅ Trovati {len(symbols)} simboli su Bybit")
@@ -120,7 +165,6 @@ def monitor_loop():
                 price = closes[-1]
                 key = f"{symbol}_{tf}"
 
-                # primo ciclo: memorizza ma non invia
                 if key not in last_prices:
                     last_prices[key] = price
                     continue
@@ -129,6 +173,12 @@ def monitor_loop():
                 threshold = THRESHOLDS[tf]
                 print(f"[{tf}] {symbol}: {variation:+.2f}% (soglia {threshold})")
 
+                # trend detection
+                trend_signal = detect_trend_signal(closes, vols)
+                if trend_signal:
+                    send_telegram(f"🔍 **{symbol}** — {trend_signal} ({tf})")
+
+                # variazioni classiche
                 if abs(variation) >= threshold:
                     now_t = time.time()
                     if key in last_alert_time and now_t - last_alert_time[key] < COOLDOWN_SECONDS:
@@ -160,6 +210,7 @@ def monitor_loop():
 
         time.sleep(LOOP_DELAY)
 
+# === MAIN ===
 if __name__ == "__main__":
     print(f"🚀 Avvio monitor Bybit — TF {FAST_TFS + SLOW_TFS}, thresholds {THRESHOLDS}")
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
