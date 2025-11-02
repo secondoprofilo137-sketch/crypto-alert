@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Bybit monitor — versione 3.0 con Trend Detector integrato
+# Bybit monitor — versione 3.1 con Trend Detector 4H e cooldown 1h
 
 import os
 import time
@@ -19,10 +19,12 @@ PORT = int(os.getenv("PORT", 10000))
 
 FAST_TFS = ["1m", "3m"]
 SLOW_TFS = ["1h"]
+TREND_TF = "4h"  # Analisi trend
 LOOP_DELAY = int(os.getenv("LOOP_DELAY", 5))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", 3600))
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
+TREND_COOLDOWN = 3600  # 1 ora di cooldown per trend alert
 
 THRESHOLDS = {
     "1m": float(os.getenv("THRESH_1M", 7.5)),
@@ -41,6 +43,7 @@ RISK_MAPPING = {
 exchange = ccxt.bybit({"options": {"defaultType": "swap"}})
 last_prices = {}
 last_alert_time = {}
+last_trend_alert = {}
 app = Flask(__name__)
 
 # === TELEGRAM ===
@@ -110,16 +113,25 @@ def trendline_break(closes):
         return "break_down"
     return None
 
-def detect_trend_signal(closes, vols):
+def detect_trend_signal(symbol, closes, vols):
     structure = detect_structure(closes)
     break_signal = trendline_break(closes)
     if not vols or len(vols) < 6:
         return None
     volume_ratio = vols[-1] / max(mean(vols[-6:-1]), 1)
+    now_t = time.time()
+    key = f"{symbol}_trend"
+
+    # filtro doppioni 1h
+    if key in last_trend_alert and now_t - last_trend_alert[key] < TREND_COOLDOWN:
+        return None
+
     if structure == "higher_low" and break_signal == "break_up" and volume_ratio > 1.5:
-        return f"📈 Trend RIALZISTA POTENZIALE — vol×{volume_ratio:.2f}"
+        last_trend_alert[key] = now_t
+        return f"📈 **{symbol}** — Trend RIALZISTA POTENZIALE — vol×{volume_ratio:.2f}"
     elif structure == "lower_high" and break_signal == "break_down" and volume_ratio > 1.5:
-        return f"📉 Trend RIBASSISTA POTENZIALE — vol×{volume_ratio:.2f}"
+        last_trend_alert[key] = now_t
+        return f"📉 **{symbol}** — Trend RIBASSISTA POTENZIALE — vol×{volume_ratio:.2f}"
     return None
 
 # === EXCHANGE HELPERS ===
@@ -149,14 +161,18 @@ def test():
     send_telegram(f"🧪 TEST OK — {now}")
     return "Telegram test inviato", 200
 
-# === MAIN MONITOR LOOP ===
+# === MONITOR LOOP ===
 def monitor_loop():
     symbols = get_bybit_symbols()
     print(f"✅ Trovati {len(symbols)} simboli su Bybit")
     last_heartbeat = 0
     initialized = False
+    last_trend_check = 0
 
     while True:
+        now_t = time.time()
+        trend_check_due = now_t - last_trend_check >= 14400  # ogni 4h
+
         for symbol in symbols[:MAX_CANDIDATES_PER_CYCLE]:
             for tf in FAST_TFS + SLOW_TFS:
                 closes, vols = safe_fetch(symbol, tf, 60)
@@ -173,14 +189,7 @@ def monitor_loop():
                 threshold = THRESHOLDS[tf]
                 print(f"[{tf}] {symbol}: {variation:+.2f}% (soglia {threshold})")
 
-                # trend detection
-                trend_signal = detect_trend_signal(closes, vols)
-                if trend_signal:
-                    send_telegram(f"🔍 **{symbol}** — {trend_signal} ({tf})")
-
-                # variazioni classiche
                 if abs(variation) >= threshold:
-                    now_t = time.time()
                     if key in last_alert_time and now_t - last_alert_time[key] < COOLDOWN_SECONDS:
                         continue
                     last_alert_time[key] = now_t
@@ -199,6 +208,17 @@ def monitor_loop():
                     send_telegram(msg)
                     last_prices[key] = price
 
+            # Analisi trend 4h (ogni 4 ore)
+            if trend_check_due:
+                closes4h, vols4h = safe_fetch(symbol, TREND_TF, 100)
+                if closes4h:
+                    trend_msg = detect_trend_signal(symbol, closes4h, vols4h)
+                    if trend_msg:
+                        send_telegram(f"🔍 {trend_msg}")
+
+        if trend_check_due:
+            last_trend_check = now_t
+
         if not initialized:
             print("✅ Inizializzazione completata. Ora partono i confronti reali.")
             initialized = True
@@ -212,7 +232,7 @@ def monitor_loop():
 
 # === MAIN ===
 if __name__ == "__main__":
-    print(f"🚀 Avvio monitor Bybit — TF {FAST_TFS + SLOW_TFS}, thresholds {THRESHOLDS}")
+    print(f"🚀 Avvio monitor Bybit — TF {FAST_TFS + SLOW_TFS}, thresholds {THRESHOLDS}, trend su {TREND_TF}")
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
     while True:
