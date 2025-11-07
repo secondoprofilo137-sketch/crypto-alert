@@ -1,83 +1,71 @@
+#!/usr/bin/env python3
 # monitor_bybit_flask.py
-# Versione 4.1 — Trend + RSI + MACD + Volume spike + breakout + scoring + report 12h
-from __future__ import annotations
+# Versione 4.1 — Trend + RSI + MACD + Volume spike + Breakout + Scoring + RSI Filter (4h)
+# Flask + multi-chat Telegram + cooldown
+
 import os
 import time
 import threading
 import math
-import heapq
 from statistics import mean, pstdev
 from datetime import datetime, timezone
 import requests
 import ccxt
 from flask import Flask
 
-# -----------------------
-# CONFIG (env or defaults)
-# -----------------------
+# === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
 PORT = int(os.getenv("PORT", 10000))
 
-FAST_TFS = os.getenv("FAST_TFS", "1m,3m").split(",")
-SLOW_TFS = os.getenv("SLOW_TFS", "1h,4h").split(",")
+FAST_TFS = ["1m", "3m"]
+SLOW_TFS = ["1h"]
 LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", 3600))
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
 
-# thresholds per timeframe
-THRESH_1M = float(os.getenv("THRESH_1M", 7.5))
-THRESH_3M = float(os.getenv("THRESH_3M", 11.5))
-THRESH_1H = float(os.getenv("THRESH_1H", 17.0))
-THRESH_4H = float(os.getenv("THRESH_4H", 12.0))
-THRESHOLDS = {"1m": THRESH_1M, "3m": THRESH_3M, "1h": THRESH_1H, "4h": THRESH_4H}
+THRESHOLDS = {
+    "1m": float(os.getenv("THRESH_1M", 7.5)),
+    "3m": float(os.getenv("THRESH_3M", 11.5)),
+    "1h": float(os.getenv("THRESH_1H", 17.0)),
+}
 
-# volume spike / filtering
 VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", 100.0))
-VOLUME_SPIKE_MIN_VOLUME = float(os.getenv("VOLUME_SPIKE_MIN_VOLUME", 500000.0))
 VOLUME_MIN_USD = float(os.getenv("VOLUME_MIN_USD", 1000000.0))
 VOLUME_COOLDOWN_SECONDS = int(os.getenv("VOLUME_COOLDOWN_SECONDS", 300))
 
-# volatility tiers
+REPORT_INTERVAL_HOURS = 6
+REPORT_MIN_SCORE = 75  # soglia minima
+REPORT_RSI_MIN = 35
+REPORT_RSI_MAX = 70
+
 VOL_TIER_THRESHOLDS = {"low": 0.002, "medium": 0.006, "high": 0.012}
 
-# report configuration
-REPORT_INTERVAL_SEC = int(os.getenv("REPORT_12H_INTERVAL_SEC", 43200))  # 12 ore
-TOP_N_REPORT = int(os.getenv("TOP_N_REPORT", 5))
-
-# exchange + state
 exchange = ccxt.bybit({"options": {"defaultType": "swap"}})
-last_prices: dict = {}
-last_alert_time: dict = {}
-last_volume_alert_time: dict = {}
-last_report_time = 0
-report_cache = []
+last_prices = {}
+last_alert_time = {}
+last_volume_alert_time = {}
 app = Flask(__name__)
 
-# -----------------------
-# Helpers: Telegram
-# -----------------------
+# === TELEGRAM ===
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_IDS:
-        print("❌ Telegram non configurato.")
-        print(text)
+        print("⚠️ Telegram non configurato")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for cid in CHAT_IDS:
-        payload = {"chat_id": cid, "text": text, "disable_web_page_preview": True, "parse_mode": "Markdown"}
         try:
-            r = requests.post(url, data=payload, timeout=10)
-            if r.status_code != 200:
-                print(f"⚠️ Telegram error {r.status_code}: {r.text}")
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+                timeout=10,
+            )
         except Exception as e:
-            print(f"❌ Telegram send error: {e}")
+            print(f"❌ Telegram error: {e}")
 
-# -----------------------
-# Indicators
-# -----------------------
+# === INDICATORI ===
 def compute_ema(prices, period):
-    if not prices or len(prices) < 2:
+    if not prices or len(prices) < period:
         return None
     k = 2 / (period + 1)
     ema = prices[0]
@@ -90,7 +78,7 @@ def compute_rsi(prices, period=14):
         return None
     gains, losses = [], []
     for i in range(1, len(prices)):
-        diff = prices[i] - prices[i-1]
+        diff = prices[i] - prices[i - 1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
     avg_gain = sum(gains[-period:]) / period
@@ -105,27 +93,16 @@ def compute_macd(prices, fast=12, slow=26, signal=9):
         return None, None
     ema_fast = compute_ema(prices, fast)
     ema_slow = compute_ema(prices, slow)
-    macd = ema_fast - ema_slow if ema_fast and ema_slow else None
-    if macd is None:
-        return None, None
-    macd_series = []
-    for i in range(slow - 1, len(prices)):
-        ef = compute_ema(prices[:i+1], fast)
-        es = compute_ema(prices[:i+1], slow)
-        macd_series.append(ef - es)
-    if len(macd_series) < signal:
-        return macd, None
-    signal_line = compute_ema(macd_series, signal)
+    macd = ema_fast - ema_slow if ema_fast and ema_slow else 0
+    signal_line = compute_ema([macd], signal)
     return macd, signal_line
 
-# -----------------------
-# Analytics / scoring
-# -----------------------
+# === ANALYTICS ===
 def compute_volatility_logreturns(closes):
     if len(closes) < 3:
         return 0.0
-    lr = [math.log(closes[i]/closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
-    return pstdev(lr)
+    lr = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
+    return pstdev(lr) if len(lr) > 1 else 0.0
 
 def estimate_volatility_tier(closes, volumes):
     vol = compute_volatility_logreturns(closes[-30:]) if len(closes) >= 30 else compute_volatility_logreturns(closes)
@@ -140,161 +117,133 @@ def estimate_volatility_tier(closes, volumes):
     vol_ratio = 1.0
     if volumes and len(volumes) >= 6:
         baseline = mean(volumes[-6:-1])
-        last_vol = volumes[-1]
-        if baseline:
-            vol_ratio = last_vol / baseline
+        if baseline > 0:
+            vol_ratio = volumes[-1] / baseline
     return tier, vol_ratio
 
-def breakout_score(closes, lookback=20):
-    if len(closes) < lookback + 1:
-        return 0, None
-    recent = closes[-(lookback+1):-1]
-    last = closes[-1]
-    hi, lo = max(recent), min(recent)
-    if last > hi:
-        return 20, f"Breakout sopra max {hi:.6f}"
-    if last < lo:
-        return -10, f"Rotto min {lo:.6f}"
-    return 0, None
+def detect_volume_spike(volumes, multiplier=VOLUME_SPIKE_MULTIPLIER):
+    if len(volumes) < 6:
+        return False, 1.0
+    avg_prev = mean(volumes[-6:-1])
+    if avg_prev <= 0:
+        return False, 1.0
+    ratio = volumes[-1] / avg_prev
+    return ratio >= multiplier, ratio
 
-def score_signals(prices, volumes, variation, tf):
-    score, reasons = 0, []
-    ema10, ema30 = compute_ema(prices, 10), compute_ema(prices, 30)
-    direction = None
+# === SCORING ===
+def score_signals(closes, vols, variation, tf):
+    score = 0
+    ema10 = compute_ema(closes, 10)
+    ema30 = compute_ema(closes, 30)
     if ema10 and ema30:
-        diff_pct = ((ema10 - ema30) / ema30) * 100
-        if diff_pct > 0.8:
-            score += 20
-            direction = "📈 rialzista"
-            reasons.append(f"EMA10>EMA30 ({diff_pct:.2f}%)")
-        elif diff_pct < -0.8:
-            score -= 15
-            direction = "📉 ribassista"
-            reasons.append(f"EMA10<EMA30 ({diff_pct:.2f}%)")
-    macd, signal = compute_macd(prices)
+        diff = (ema10 - ema30) / ema30 * 100
+        if diff > 1: score += 20
+        elif diff < -1: score -= 10
+    macd, signal = compute_macd(closes)
     if macd and signal:
-        if macd > signal:
-            score += 15
-            reasons.append("MACD bullish")
-        else:
-            score -= 7
-            reasons.append("MACD bearish")
-    rsi = compute_rsi(prices)
+        if macd > signal: score += 10
+        else: score -= 5
+    rsi = compute_rsi(closes)
     if rsi:
-        if rsi < 35:
-            score += 10
-            reasons.append(f"RSI {rsi:.1f} (oversold)")
-        elif rsi > 70:
-            score -= 15
-            reasons.append(f"RSI {rsi:.1f} (overbought)")
-    bs, br = breakout_score(prices)
-    score += bs
-    if br:
-        reasons.append(br)
-    mag = min(25, abs(variation))
-    if variation > 0:
-        score += mag * 0.6
-    else:
-        score -= mag * 0.4
-    _, vol_ratio = estimate_volatility_tier(prices, volumes)
+        if rsi < 35: score += 10
+        elif rsi > 70: score -= 10
+    _, vol_ratio = estimate_volatility_tier(closes, vols)
     if vol_ratio >= VOLUME_SPIKE_MULTIPLIER:
         score += 25
-        reasons.append(f"Vol spike {vol_ratio:.1f}×")
-    elif vol_ratio >= 5:
+    elif vol_ratio > 5:
         score += 5
-        reasons.append(f"Vol ratio {vol_ratio:.1f}×")
-    raw = max(-100, min(100, score))
-    normalized = int((raw + 100) / 2)
-    return normalized, reasons, {"rsi": rsi, "ema10": ema10, "ema30": ema30, "vol_ratio": vol_ratio, "direction": direction}
+    return min(100, max(0, score)), {"rsi": rsi}
 
-# -----------------------
-# Flask endpoints
-# -----------------------
-@app.route("/")
-def home():
-    return "✅ Crypto Alert Bot (Bybit) — running"
-
-@app.route("/test")
-def test():
-    send_telegram("🧪 TEST ALERT — bot online")
-    return "Test sent", 200
-
-# -----------------------
-# Monitor loop
-# -----------------------
-def safe_fetch_ohlcv(symbol, tf, limit=120):
+# === EXCHANGE ===
+def safe_fetch_ohlcv(symbol, timeframe, limit=120):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         closes = [c[4] for c in ohlcv]
         vols = [c[5] for c in ohlcv]
         return closes, vols
-    except Exception as e:
-        print(f"⚠️ fetch error {symbol} {tf}: {e}")
+    except Exception:
         return None, None
 
-def get_bybit_derivative_symbols():
+def get_symbols():
     try:
-        markets = exchange.load_markets()
-        return [s for s, m in markets.items() if m.get("type") == "swap" or s.endswith(":USDT")]
-    except Exception as e:
-        print("⚠️ load_markets:", e)
+        mkts = exchange.load_markets()
+        return [s for s in mkts.keys() if s.endswith(":USDT")]
+    except Exception:
         return []
 
+# === FLASK ROUTES ===
+@app.route("/")
+def home():
+    return "✅ Bybit Flask bot attivo"
+
+@app.route("/test")
+def test():
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    send_telegram(f"🧪 TEST OK — {now}")
+    return "OK", 200
+
+# === MONITOR LOOP ===
 def monitor_loop():
-    symbols = get_bybit_derivative_symbols()
-    print(f"✅ {len(symbols)} simboli trovati")
-    global last_report_time
+    symbols = get_symbols()
+    print(f"✅ Simboli trovati: {len(symbols)}")
     last_heartbeat = 0
+    last_report_time = 0
 
     while True:
-        start_cycle = time.time()
-        for sym in symbols[:MAX_CANDIDATES_PER_CYCLE]:
-            for tf in ["4h"]:
-                closes, vols = safe_fetch_ohlcv(sym, tf, 120)
+        # ---- PRICE ALERT ----
+        for symbol in symbols[:MAX_CANDIDATES_PER_CYCLE]:
+            for tf in FAST_TFS + SLOW_TFS:
+                closes, vols = safe_fetch_ohlcv(symbol, tf)
                 if not closes:
                     continue
                 price = closes[-1]
-                score, reasons, d = score_signals(closes, vols, 0, tf)
-                if score >= 60:
+                key = f"{symbol}_{tf}"
+                if key not in last_prices:
+                    last_prices[key] = price
+                    continue
+                variation = ((price - last_prices[key]) / last_prices[key]) * 100
+                if abs(variation) >= THRESHOLDS.get(tf, 5):
+                    score, data = score_signals(closes, vols, variation, tf)
+                    rsi = data["rsi"]
+                    trend = "📈 Rialzo" if variation > 0 else "📉 Crollo"
                     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    msg = (
-                        f"🎯 Analisi {tf} — *{sym}*\n"
-                        f"🇮🇹 Score: *{score}/100*\n💰 Prezzo: {price:.6f}\n"
-                    )
-                    if "Breakout" in ";".join(reasons):
-                        msg += "🌀 Mercato in compressione — preparati per il breakout\n"
-                    if d["direction"]:
-                        msg += f"📊 Trend {d['direction']}\n"
-                    msg += "▪ " + "; ".join(reasons) + f"\n{now}"
-                    send_telegram(msg)
-                    report_cache.append((score, sym, price, d["rsi"], d["vol_ratio"], d["direction"]))
-                    if len(report_cache) > 200:
-                        report_cache[:] = report_cache[-200:]
+                    text = f"🔔 ALERT {symbol} {tf}\n{trend} {variation:+.2f}% | RSI {rsi:.1f} | Score {score}\n[{now}]"
+                    send_telegram(text)
+                last_prices[key] = price
 
-        # report ogni 12 ore
-        if time.time() - last_report_time >= REPORT_INTERVAL_SEC and report_cache:
-            top = heapq.nlargest(TOP_N_REPORT, report_cache, key=lambda x: x[0])
-            text = "🏆 *Top 5 Coin più promettenti (ultime 12h)*\n"
-            for sc, sm, pr, rsi, vr, direction in top:
-                text += f"• {sm} — {direction or ''} | Score {sc}/100 | RSI {rsi:.1f} | Vol×{vr:.1f} | {pr:.6f}\n"
-            text += "\n🕒 " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            send_telegram(text)
+        # ---- 4H TREND REPORT ----
+        if time.time() - last_report_time >= REPORT_INTERVAL_HOURS * 3600:
+            trend_candidates = []
+            for sym in symbols[:MAX_CANDIDATES_PER_CYCLE]:
+                closes, vols = safe_fetch_ohlcv(sym, "4h")
+                if not closes:
+                    continue
+                score, data = score_signals(closes, vols, 0, "4h")
+                rsi = data["rsi"]
+                if not (rsi and REPORT_RSI_MIN <= rsi <= REPORT_RSI_MAX):
+                    continue  # filtro RSI 35-70
+                if score >= REPORT_MIN_SCORE:
+                    trend_candidates.append((sym, score, rsi))
+            if trend_candidates:
+                trend_candidates.sort(key=lambda x: x[1], reverse=True)
+                msg = "📊 *REPORT 4H — Coin in compressione*\n"
+                for sym, score, rsi in trend_candidates[:10]:
+                    msg += f"• *{sym}*: Score {score} | RSI {rsi:.1f}\n"
+                msg += "\n💡 Mercato in compressione — preparati per un breakout."
+                send_telegram(msg)
             last_report_time = time.time()
 
-        # heartbeat
+        # Heartbeat
         if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-            send_telegram(f"💓 Heartbeat — bot attivo ({len(symbols)} simboli)")
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            send_telegram(f"💓 Heartbeat — attivo ({now}) | Simboli: {len(symbols)}")
             last_heartbeat = time.time()
 
-        elapsed = time.time() - start_cycle
-        if elapsed < LOOP_DELAY:
-            time.sleep(LOOP_DELAY - elapsed)
+        time.sleep(LOOP_DELAY)
 
-# -----------------------
-# Entrypoint
-# -----------------------
+# === MAIN ===
 if __name__ == "__main__":
-    print(f"🚀 Avvio monitor Bybit — loop {LOOP_DELAY}s")
+    print("🚀 Avvio monitor con filtro RSI 35–70 per 4H report")
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
     while True:
