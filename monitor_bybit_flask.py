@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # monitor_bybit_flask.py
-# Versione with Early Momentum Detector (trade-based spike early alerts)
-
+# Bybit monitor — Flask + multi-chat Telegram + spike + scoring + 4h Wyckoff reports
+from __future__ import annotations
 import os
 import time
 import threading
@@ -12,17 +12,21 @@ import requests
 import ccxt
 from flask import Flask
 
-# === CONFIG (ENV or defaults) ===
+# -----------------------
+# CONFIG (env or defaults)
+# -----------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Multiple chat ids separated by comma
 CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
 PORT = int(os.getenv("PORT", 10000))
 
 FAST_TFS = os.getenv("FAST_TFS", "1m,3m").split(",")
 SLOW_TFS = os.getenv("SLOW_TFS", "1h").split(",")
+REPORT_TF = os.getenv("REPORT_TF", "4h")  # timeframe used for 4h report (kept as env for flexibility)
 LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", 3600))
 MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))  # per-symbol+tf cooldown for price alerts
 
 # thresholds per timeframe
 THRESH_1M = float(os.getenv("THRESH_1M", 7.5))
@@ -30,53 +34,62 @@ THRESH_3M = float(os.getenv("THRESH_3M", 11.5))
 THRESH_1H = float(os.getenv("THRESH_1H", 17.0))
 THRESHOLDS = {"1m": THRESH_1M, "3m": THRESH_3M, "1h": THRESH_1H}
 
-# Volume spike / early detector config
-EARLY_SPIKE_MODE = os.getenv("EARLY_SPIKE_MODE", "true").lower() in ("1", "true", "yes")
-EARLY_WINDOW_SEC = int(os.getenv("EARLY_WINDOW_SEC", 15))               # window to measure last trades (seconds)
-EARLY_BASE_WINDOWS = int(os.getenv("EARLY_BASE_WINDOWS", 6))            # how many previous windows to average
-EARLY_MULTIPLIER = float(os.getenv("EARLY_MULTIPLIER", 50.0))           # multiplier threshold (e.g. 50x)
-EARLY_MIN_USD = float(os.getenv("EARLY_MIN_USD", 50000.0))              # min USD turnover in last window
-EARLY_COOLDOWN_SECONDS = int(os.getenv("EARLY_COOLDOWN_SECONDS", 60))   # per-symbol early alerts cooldown
-
-# volume/candle spike filters (kept for standard alerts)
+# volume spike / filtering
 VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", 100.0))
-VOLUME_SPIKE_MIN_VOLUME = float(os.getenv("VOLUME_SPIKE_MIN_VOLUME", 500000.0))
-VOLUME_MIN_USD = float(os.getenv("VOLUME_MIN_USD", 1000000.0))
+VOLUME_SPIKE_MIN_VOLUME = float(os.getenv("VOLUME_SPIKE_MIN_VOLUME", 500000.0))  # base asset units
+VOLUME_MIN_USD = float(os.getenv("VOLUME_MIN_USD", 1000000.0))  # turnover USD min to trigger
 VOLUME_COOLDOWN_SECONDS = int(os.getenv("VOLUME_COOLDOWN_SECONDS", 300))
+
+# report settings (4h): every N seconds, and min score threshold
+REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", 6 * 3600))  # every 6 hours
+REPORT_TOP_N = int(os.getenv("REPORT_TOP_N", 10))
+REPORT_SCORE_MIN = int(os.getenv("REPORT_SCORE_MIN", 60))
 
 # volatility tiers
 VOL_TIER_THRESHOLDS = {"low": 0.002, "medium": 0.006, "high": 0.012}
 
-# exchange + app
+# exchange + state
 exchange = ccxt.bybit({"options": {"defaultType": "swap"}})
+last_prices: dict = {}           # key = symbol_tf -> last price stored
+last_alert_time: dict = {}       # key = symbol_tf -> ts
+last_volume_alert_time: dict = {}  # symbol -> ts
 app = Flask(__name__)
 
-# runtime state
-last_prices = {}
-last_alert_time = {}
-last_volume_alert_time = {}
-last_early_alert_time = {}
-
-# === TELEGRAM ===
+# -----------------------
+# Telegram helper
+# -----------------------
 def send_telegram(text: str):
+    """Invia a tutti i chat_ids configurati. Se telegram non è settato, stampa in console."""
     if not TELEGRAM_TOKEN or not CHAT_IDS:
-        print("❌ Telegram not configured; debug message:\n", text)
-        return
+        print("❌ Telegram non configurato (TOKEN/CHAT_ID mancanti). Messaggio di debug:")
+        print(text)
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    success = True
     for cid in CHAT_IDS:
-        payload = {"chat_id": cid, "text": text, "disable_web_page_preview": True, "parse_mode": "Markdown"}
+        payload = {
+            "chat_id": cid,
+            "text": text,
+            "disable_web_page_preview": True,
+            "parse_mode": "Markdown"
+        }
         try:
             r = requests.post(url, data=payload, timeout=10)
             if r.status_code != 200:
-                print(f"⚠️ Telegram error {r.status_code} for {cid}: {r.text}")
+                print(f"⚠️ Errore Telegram {r.status_code} per {cid}: {r.text}")
+                success = False
         except Exception as e:
             print(f"❌ Exception sending Telegram to {cid}: {e}")
+            success = False
+    return success
 
-# === INDICATORS & HELPERS ===
+# -----------------------
+# Indicators
+# -----------------------
 def compute_ema(prices, period):
     if not prices or len(prices) < 2:
         return None
-    k = 2 / (period + 1)
+    k = 2.0 / (period + 1)
     ema = prices[0]
     for p in prices[1:]:
         ema = p * k + ema * (1 - k)
@@ -105,12 +118,12 @@ def compute_macd(prices, fast=12, slow=26, signal=9):
     if ema_fast is None or ema_slow is None:
         return None, None
     macd = ema_fast - ema_slow
-    # approximate signal line
+    # approximate signal line by computing ema of macd over the series
     macd_series = []
     for i in range(slow - 1, len(prices)):
-        window = prices[: i + 1]
-        ef = compute_ema(window, fast)
-        es = compute_ema(window, slow)
+        w = prices[: i + 1]
+        ef = compute_ema(w, fast)
+        es = compute_ema(w, slow)
         if ef is None or es is None:
             continue
         macd_series.append(ef - es)
@@ -119,6 +132,9 @@ def compute_macd(prices, fast=12, slow=26, signal=9):
     signal_line = compute_ema(macd_series, signal)
     return macd, signal_line
 
+# -----------------------
+# Scoring & helpers
+# -----------------------
 def compute_volatility_logreturns(closes):
     if len(closes) < 3:
         return 0.0
@@ -161,49 +177,75 @@ def breakout_score(closes, lookback=20):
         return -10, f"Rotto min {lo:.6f}"
     return 0, None
 
+def detect_volume_spike(volumes, multiplier=VOLUME_SPIKE_MULTIPLIER):
+    if not volumes or len(volumes) < 6:
+        return False, 1.0
+    avg_prev = mean(volumes[-6:-1]) if len(volumes) >= 6 else mean(volumes[:-1])
+    last = volumes[-1]
+    if avg_prev <= 0:
+        return False, 1.0
+    ratio = last / avg_prev
+    return ratio >= multiplier, ratio
+
 def score_signals(prices, volumes, variation, tf):
     score = 0
     reasons = []
+    # EMA 10/30
     ema10 = compute_ema(prices, 10)
     ema30 = compute_ema(prices, 30)
     if ema10 and ema30:
         diff_pct = ((ema10 - ema30) / ema30) * 100 if ema30 else 0.0
         if diff_pct > 0.8:
-            score += 20; reasons.append(f"EMA10>EMA30 ({diff_pct:.2f}%)")
+            score += 20
+            reasons.append(f"EMA10>EMA30 ({diff_pct:.2f}%)")
         elif diff_pct < -0.8:
-            score -= 15; reasons.append(f"EMA10<EMA30 ({diff_pct:.2f}%)")
+            score -= 15
+            reasons.append(f"EMA10<EMA30 ({diff_pct:.2f}%)")
+    # MACD
     macd, signal = compute_macd(prices)
     if macd is not None and signal is not None:
         if macd > signal:
-            score += 15; reasons.append("MACD bullish")
+            score += 15
+            reasons.append("MACD bullish")
         else:
-            score -= 7; reasons.append("MACD bearish")
+            score -= 7
+            reasons.append("MACD bearish")
+    # RSI
     rsi = compute_rsi(prices, 14)
     if rsi is not None:
         if rsi < 35:
-            score += 10; reasons.append(f"RSI {rsi:.1f} (oversold)")
+            score += 10
+            reasons.append(f"RSI {rsi:.1f} (oversold)")
         elif rsi > 70:
-            score -= 15; reasons.append(f"RSI {rsi:.1f} (overbought)")
+            score -= 15
+            reasons.append(f"RSI {rsi:.1f} (overbought)")
+    # breakout
     bs, br = breakout_score(prices, lookback=20)
     score += bs
     if br:
         reasons.append(br)
+    # variation magnitude weight
     mag = min(25, abs(variation))
     if variation > 0:
         score += mag * 0.6
     else:
         score -= mag * 0.4
+    # volume ratio
     _, vol_ratio = estimate_volatility_tier(prices, volumes)
     if vol_ratio and vol_ratio >= VOLUME_SPIKE_MULTIPLIER:
-        score += 25; reasons.append(f"Vol spike {vol_ratio:.1f}×")
+        score += 25
+        reasons.append(f"Vol spike {vol_ratio:.1f}×")
     elif vol_ratio and vol_ratio >= 5:
-        score += 5; reasons.append(f"Vol ratio {vol_ratio:.1f}×")
+        score += 5
+        reasons.append(f"Vol ratio {vol_ratio:.1f}×")
     raw = max(-100, min(100, score))
     normalized = int((raw + 100) / 2)
     return normalized, reasons, {"rsi": rsi, "macd": macd, "signal": signal, "ema10": ema10, "ema30": ema30, "vol_ratio": vol_ratio}
 
-# === EXCHANGE HELPERS ===
-def safe_fetch_ohlcv(symbol, timeframe, limit=60):
+# -----------------------
+# Exchange helpers
+# -----------------------
+def safe_fetch_ohlcv(symbol, timeframe, limit=120):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         closes = [c[4] for c in ohlcv]
@@ -218,78 +260,16 @@ def get_bybit_derivative_symbols():
         markets = exchange.load_markets()
         syms = []
         for s, m in markets.items():
-            if m.get("type") == "swap" or s.endswith(":USDT"):
+            if m.get("type") == "swap" or s.endswith(":USDT") or "/USDT" in s:
                 syms.append(s)
         return sorted(set(syms))
     except Exception as e:
         print("⚠️ load_markets:", e)
         return []
 
-# === EARLY SPIKE DETECTOR (trades) ===
-def fetch_recent_trades(symbol, limit=500):
-    try:
-        trades = exchange.fetch_trades(symbol, limit=limit)
-        return trades
-    except Exception as e:
-        # don't spam logs
-        # print(f"⚠️ fetch_trades {symbol}: {e}")
-        return []
-
-def compute_trade_window_volumes(trades, now_ms, window_sec=15, base_windows=6):
-    """
-    Partition trades into windows of window_sec seconds ending at now.
-    Return last_window_usd, baseline_avg_usd (avg of previous base_windows windows).
-    trades: list of ccxt trade dicts with 'timestamp', 'price', 'amount'
-    """
-    if not trades:
-        return 0.0, 0.0, []
-    window_ms = window_sec * 1000
-    # compute per-window USD volumes for last (base_windows + 1) windows
-    volumes = []
-    start = now_ms - (window_ms * (base_windows + 1))
-    # initialize bins
-    for w in range(base_windows + 1):
-        volumes.append(0.0)
-    for t in trades:
-        ts = t.get("timestamp") or 0
-        if ts < start:
-            continue
-        idx = int((ts - start) // window_ms)
-        if 0 <= idx < len(volumes):
-            price = t.get("price") or 0.0
-            amount = t.get("amount") or 0.0
-            usd = price * amount
-            volumes[idx] += usd
-    # last window is last element
-    last_window_usd = volumes[-1]
-    prev_windows = volumes[:-1]
-    # compute baseline average over previous base_windows (if enough)
-    baseline = 0.0
-    cnt = 0
-    for v in prev_windows[-base_windows:]:
-        baseline += v
-        cnt += 1
-    baseline_avg = (baseline / cnt) if cnt > 0 else 0.0
-    return last_window_usd, baseline_avg, volumes
-
-def detect_early_spike_by_trades(symbol):
-    """
-    Return (is_spike: bool, ratio: float, last_window_usd: float)
-    """
-    trades = fetch_recent_trades(symbol, limit=500)
-    if not trades:
-        return False, 1.0, 0.0
-    now_ms = int(time.time() * 1000)
-    last_usd, baseline_avg, volumes = compute_trade_window_volumes(
-        trades, now_ms, window_sec=EARLY_WINDOW_SEC, base_windows=EARLY_BASE_WINDOWS
-    )
-    if baseline_avg <= 0:
-        return False, 1.0, last_usd
-    ratio = last_usd / baseline_avg
-    is_spike = (ratio >= EARLY_MULTIPLIER) and (last_usd >= EARLY_MIN_USD)
-    return is_spike, ratio, last_usd
-
-# === FLASK endpoints ===
+# -----------------------
+# Flask endpoints
+# -----------------------
 @app.route("/")
 def home():
     return "✅ Crypto Alert Bot (Bybit) — running"
@@ -300,18 +280,67 @@ def test():
     send_telegram(f"🧪 TEST ALERT — bot online ({now})")
     return "Test sent", 200
 
-# === MONITOR LOOP ===
+# -----------------------
+# 4h Report builder
+# -----------------------
+def build_and_send_4h_report(symbols):
+    """Analizza simboli su timeframe 4h (REPORT_TF) e invia top N con score > REPORT_SCORE_MIN.
+       Prefisso 'WYCKOFF' richiesto, e messaggio 'mercato in compressione...' se rilevata compressione."""
+    results = []
+    for s in symbols:
+        closes, vols = safe_fetch_ohlcv(s, REPORT_TF, limit=120)
+        if not closes:
+            continue
+        price = closes[-1]
+        # compute score (variation measured vs last stored price if exists)
+        key = f"{s}_{REPORT_TF}"
+        prev = last_prices.get(key, closes[-2] if len(closes) >= 2 else price)
+        try:
+            variation = ((price - prev) / prev) * 100 if prev else 0.0
+        except Exception:
+            variation = 0.0
+        score, reasons, details = score_signals(closes, vols, variation, REPORT_TF)
+        results.append((s, score, variation, reasons, details, price, closes, vols))
+    # sort descending by score, filter > REPORT_SCORE_MIN
+    filtered = [r for r in sorted(results, key=lambda x: x[1], reverse=True) if r[1] >= REPORT_SCORE_MIN]
+    top = filtered[:REPORT_TOP_N]
+    if not top:
+        print("🔎 Report 4h: nessun simbolo con score sufficiente.")
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    header = f"WYCKOFF — Report {REPORT_TF} top{REPORT_TOP_N} (score>={REPORT_SCORE_MIN}) — {now}\n"
+    lines = [header]
+    for (s, score, variation, reasons, details, price, closes, vols) in top:
+        vol_tier, volratio = estimate_volatility_tier(closes, vols)
+        # detect compression: low volatility & EMA close together
+        ema10 = details.get("ema10")
+        ema30 = details.get("ema30")
+        compression = False
+        if ema10 and ema30:
+            diffpct = abs((ema10 - ema30) / ema30) * 100 if ema30 else 0.0
+            if vol_tier == "LOW" and diffpct < 0.5:
+                compression = True
+        note = " — mercato in compressione, preparati per il breakout" if compression else ""
+        reasons_text = ("; ".join(reasons)) if reasons else ""
+        lines.append(f"*{s}* | Score: *{score}/100* | Prezzo: {price:.6f} | Var: {variation:+.2f}%{note}\n▪ {reasons_text}\n")
+    message = "\n".join(lines)
+    send_telegram(message)
+
+# -----------------------
+# Monitor loop
+# -----------------------
 def monitor_loop():
     symbols = get_bybit_derivative_symbols()
     print(f"✅ Simboli derivati trovati: {len(symbols)}")
     last_heartbeat = 0
-    initialized = False
+    last_report_ts = 0
+
+    # Ensure we initialize last_prices for stable measurement: store the latest price for each symbol/tf first loop
+    first_pass = True
 
     while True:
-        start_cycle = time.time()
-        # iterate symbols (limit to candidate cap)
+        cycle_start = time.time()
         for symbol in symbols[:MAX_CANDIDATES_PER_CYCLE]:
-            # check fast + slow timeframes
             for tf in FAST_TFS + SLOW_TFS:
                 closes, vols = safe_fetch_ohlcv(symbol, tf, 120)
                 if not closes:
@@ -319,12 +348,12 @@ def monitor_loop():
                 price = closes[-1]
                 key = f"{symbol}_{tf}"
 
-                # initialize on first run
-                if key not in last_prices:
+                # initialize on first pass -> skip alerting first time to avoid spam
+                if first_pass:
                     last_prices[key] = price
                     continue
 
-                prev = last_prices[key]
+                prev = last_prices.get(key, price)
                 try:
                     variation = ((price - prev) / prev) * 100 if prev else 0.0
                 except Exception:
@@ -332,117 +361,93 @@ def monitor_loop():
 
                 threshold = THRESHOLDS.get(tf, 5.0)
 
-                # EARLY SPIKE CHECK (trade-based) -- only if enabled and tf is 1m and symbol looks like USDT pair
-                early_alert = False
-                early_ratio = 1.0
-                early_usd = 0.0
-                if EARLY_SPIKE_MODE and tf == "1m" and (symbol.endswith(":USDT") or "/USDT" in symbol):
-                    try:
-                        # rate-limit: do not spam fetch_trades too often; honored by per-symbol cooldown
-                        last_early_ts = last_early_alert_time.get(symbol, 0)
-                        if time.time() - last_early_ts >= EARLY_COOLDOWN_SECONDS:
-                            spike, ratio, usd_last = detect_early_spike_by_trades(symbol)
-                            if spike:
-                                early_alert = True
-                                early_ratio = ratio
-                                early_usd = usd_last
-                    except Exception as e:
-                        # ignore early detector errors
-                        print(f"⚠️ early detector error {symbol}: {e}")
-
-                # detect volume spike on candle-level
-                vol_spike, vol_ratio = False, 1.0
-                if vols and len(vols) >= 6:
-                    avg_prev = mean(vols[-6:-1])
-                    last_vol = vols[-1]
-                    if avg_prev and avg_prev > 0:
-                        vol_ratio = last_vol / avg_prev
-                        vol_spike = vol_ratio >= VOLUME_SPIKE_MULTIPLIER and (last_vol >= VOLUME_SPIKE_MIN_VOLUME)
-
-                # compute USD volume for candle last
+                # detect volume spike (1m only by default; adjustable)
+                vol_spike, vol_ratio = detect_volume_spike(vols, multiplier=VOLUME_SPIKE_MULTIPLIER)
+                # approx USD volume if symbol quote is USDT
                 usd_volume = 0.0
                 try:
                     if symbol.endswith(":USDT") or "/USDT" in symbol:
-                        usd_volume = price * (vols[-1] if vols else 0.0)
+                        usd_volume = price * vols[-1]
                 except Exception:
                     usd_volume = 0.0
 
                 alert_price_move = abs(variation) >= threshold
-                alert_volume = vol_spike and (usd_volume >= VOLUME_MIN_USD or (vols and vols[-1] >= VOLUME_SPIKE_MIN_VOLUME))
-                # enforce volume cooldown
+                alert_volume = vol_spike and (usd_volume >= VOLUME_MIN_USD or vols[-1] >= VOLUME_SPIKE_MIN_VOLUME)
+
                 now_t = time.time()
+                # enforce cooldown for volume alerts per symbol
                 if alert_volume:
                     last_vol_ts = last_volume_alert_time.get(symbol, 0)
                     if now_t - last_vol_ts < VOLUME_COOLDOWN_SECONDS:
                         alert_volume = False
 
-                # If early_alert triggered, send early notification (with its own cooldown)
-                if early_alert:
-                    last_early_ts = last_early_alert_time.get(symbol, 0)
-                    if now_t - last_early_ts >= EARLY_COOLDOWN_SECONDS:
-                        # Verify additional optional condition: small price movement already? we can warn anyway
-                        trend = "📈 Rialzo in formazione" if variation >= 0 else "📉 Crollo in formazione"
-                        emoji = "⚡️"
-                        tsnow = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                        txt = (
-                            f"🚨 EARLY SPIKE -> {emoji} *{symbol}* — momentum in formazione (ref {tf})\n"
-                            f"💰 Prezzo attuale: {price:.6f}\n"
-                            f"🔊 Volume recent (ultimi {EARLY_WINDOW_SEC}s): {early_usd:.0f} USD — {early_ratio:.1f}× baseline\n"
-                            f"{trend} — possibile pump, controlla orderflow / book.\n"
-                            f"[{tsnow}]"
-                        )
-                        send_telegram(txt)
-                        last_early_alert_time[symbol] = now_t
-                        # do not proceed to duplicate price alert this cycle for same key (optional)
-                        # continue
+                # enforce cooldown per key for price alerts
+                if alert_price_move:
+                    last_key_ts = last_alert_time.get(key, 0)
+                    if now_t - last_key_ts < COOLDOWN_SECONDS:
+                        alert_price_move = False
 
-                # price / candle alerts (existing logic)
                 if alert_price_move or alert_volume:
-                    last_ts = last_alert_time.get(key, 0)
-                    if now_t - last_ts >= COOLDOWN_SECONDS:
-                        score, reasons, details = score_signals(closes, vols, variation, tf)
-                        vol_tier, volratio = estimate_volatility_tier(closes, vols)
-                        trend = "📈 Rialzo" if variation > 0 else "📉 Crollo"
-                        emoji = "🔥" if tf in FAST_TFS else "⚡"
-                        tsnow = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    # build enriched message: score + reasons
+                    score, reasons, details = score_signals(closes, vols, variation, tf)
+                    vol_tier, volratio = estimate_volatility_tier(closes, vols)
+                    trend = "📈 Rialzo" if variation > 0 else "📉 Crollo"
+                    emoji = "🔥" if tf in FAST_TFS else "⚡"
+                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-                        text = (
-                            f"🔔 ALERT -> {emoji} *{symbol}* — variazione {variation:+.2f}% (ref {tf})\n"
-                            f"💰 Prezzo attuale: {price:.6f}\n"
-                        )
-                        if alert_volume:
-                            text += f"🚨 *Volume SPIKE* — {vol_ratio:.1f}× sopra la media | Volume candle: {vols[-1]:.0f} ({usd_volume:.0f} USD)\n"
-                        text += (
-                            f"{trend} rilevato — attenzione al trend.\n"
-                            f"📊 Volatilità: {vol_tier} | Vol ratio: {volratio:.2f}×\n"
-                            f"🔎 Score predittivo: *{score}/100*\n"
-                        )
-                        if reasons:
-                            text += "▪ " + "; ".join(reasons) + "\n"
-                        text += f"[{tsnow}]"
-                        send_telegram(text)
-                        last_alert_time[key] = now_t
-                        if alert_volume:
-                            last_volume_alert_time[symbol] = now_t
+                    # construct message; coin in bold as requested
+                    text = (
+                        f"🔔 ALERT -> {emoji} *{symbol}* — variazione {variation:+.2f}% (ref {tf})\n"
+                        f"💰 Prezzo attuale: {price:.6f}\n"
+                    )
+                    if alert_volume:
+                        text += f"🚨 *Volume SPIKE* — {vol_ratio:.1f}× sopra media | Volume candle: {vols[-1]:.0f} ({usd_volume:.0f} USD)\n"
+                    text += (
+                        f"{trend} rilevato — attenzione al trend.\n"
+                        f"📊 Volatilità: {vol_tier} | Vol ratio: {volratio:.2f}×\n"
+                        f"🔎 Score predittivo: *{score}/100*\n"
+                    )
+                    if reasons:
+                        text += "▪ " + "; ".join(reasons) + "\n"
+                    # If this alert is from 4h report triggers, we will prefix WYCKOFF in the report sending path (report builder).
+                    text += f"[{now}]"
 
-                # always update last_prices for next comparison
+                    send_telegram(text)
+                    # update cooldown/state
+                    last_alert_time[key] = now_t
+                    if alert_volume:
+                        last_volume_alert_time[symbol] = now_t
+
+                # always update last price after processing
                 last_prices[key] = price
+
+        first_pass = False
 
         # heartbeat
         if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            send_telegram(f"💓 Heartbeat — bot attivo ({now}) | Simboli: {len(symbols)}")
+            send_telegram(f"💓 Heartbeat — bot attivo ({now}) | Simboli monitorati: {len(symbols)}")
             last_heartbeat = time.time()
 
-        # sleep remaining of cycle
-        elapsed = time.time() - start_cycle
+        # report every REPORT_INTERVAL_SEC (4h analysis)
+        if time.time() - last_report_ts >= REPORT_INTERVAL_SEC:
+            # run report in separate thread to avoid blocking
+            threading.Thread(target=build_and_send_4h_report, args=(symbols,), daemon=True).start()
+            last_report_ts = time.time()
+
+        elapsed = time.time() - cycle_start
         if elapsed < LOOP_DELAY:
             time.sleep(LOOP_DELAY - elapsed)
 
-# === ENTRYPOINT ===
+# -----------------------
+# Entrypoint
+# -----------------------
 if __name__ == "__main__":
-    print(f"🚀 Avvio monitor Bybit — TF {FAST_TFS + SLOW_TFS}, thresholds {THRESHOLDS}, loop {LOOP_DELAY}s, EARLY_SPIKE={EARLY_SPIKE_MODE}")
+    print(f"🚀 Avvio monitor Bybit — TF {FAST_TFS + SLOW_TFS} + report {REPORT_TF}, thresholds {THRESHOLDS}, loop {LOOP_DELAY}s")
+    # start flask (keepalive) in background thread
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
+    # start monitor loop
     threading.Thread(target=monitor_loop, daemon=True).start()
+    # keep main thread alive
     while True:
         time.sleep(3600)
