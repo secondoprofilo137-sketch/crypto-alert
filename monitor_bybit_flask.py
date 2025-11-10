@@ -151,12 +151,14 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=60):
         return None, None
 
 def get_bybit_derivative_symbols():
+    """Restituisce solo i derivati (swap / perpetual) su Bybit."""
     try:
         markets = exchange.load_markets()
-        syms = []
-        for s, m in markets.items():
-            if m.get("type") == "swap" or s.endswith(":USDT") or "/USDT" in s:
-                syms.append(s)
+        syms = [
+            s for s, m in markets.items()
+            if m.get("type") == "swap" or "perpetual" in m.get("id", "").lower()
+        ]
+        print(f"✅ {len(syms)} derivati trovati su Bybit")
         return sorted(set(syms))
     except Exception as e:
         print("⚠️ load_markets error:", e)
