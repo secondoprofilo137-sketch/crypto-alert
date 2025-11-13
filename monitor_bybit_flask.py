@@ -202,12 +202,16 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=120):
 def get_bybit_derivative_symbols():
     try:
         markets = exchange.load_markets()
-        syms = []
-        for s, meta in markets.items():
-            # prefer explicit type check for derivatives
-            if meta.get("type") == "swap" or "/USDT" in s or s.endswith(":USDT"):
-                syms.append(s)
-        return sorted(set(syms))
+        symbols = []
+        for s, info in markets.items():
+            t = info.get("type", "")
+            if t == "swap" or info.get("linear") or info.get("inverse"):
+                symbols.append(s)
+            # esclude future datati e opzioni
+            elif "/USDT" in s and "USDT-" not in s and "-C" not in s and "-P" not in s:
+                symbols.append(s)
+        # evita duplicati e ordina
+        return sorted(set(symbols))
     except Exception as e:
         print("⚠️ load_markets:", e)
         return []
