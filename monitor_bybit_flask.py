@@ -48,7 +48,8 @@ REPORT_SCORE_MIN = int(os.getenv("REPORT_SCORE_MIN", 70))  # soglia richiesta pe
 # AI integration for reports
 ENABLE_GROQ_AI = os.getenv("ENABLE_GROQ_AI", "true").lower() in ("1", "true", "yes")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.ai/v1/generate")  # configurabile
+# Use the OpenAI-compatible endpoint for Groq
+GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")  # configurabile
 
 # -----------------------
 # Exchange + state
@@ -200,18 +201,36 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=120):
         return None, None
 
 def get_bybit_derivative_symbols():
+    """
+    Load markets and return a cleaned, deduplicated list of derivatives/USDT-traded symbols.
+    Normalizza simboli del tipo 'LA/USDT:USDT' -> 'LA/USDT' e rimuove duplicati.
+    """
     try:
         markets = exchange.load_markets()
         symbols = []
         for s, info in markets.items():
             t = info.get("type", "")
+            # prefer swap / linear / inverse markets
             if t == "swap" or info.get("linear") or info.get("inverse"):
                 symbols.append(s)
-            # esclude future datati e opzioni
+            # include spot-like USDT markets for consideration (ma escludi opzioni/future datati)
             elif "/USDT" in s and "USDT-" not in s and "-C" not in s and "-P" not in s:
                 symbols.append(s)
-        # evita duplicati e ordina
-        return sorted(set(symbols))
+
+        # normalize and remove duplicates, prefer base format without ':USDT' suffix
+        normalized = set()
+        raw_set = set(symbols)
+        for s in raw_set:
+            if s.endswith(":USDT"):
+                base = s.replace(":USDT", "")
+                # prefer existing base if present; otherwise use base
+                if base in raw_set:
+                    continue
+                normalized.add(base)
+            else:
+                normalized.add(s)
+        cleaned = sorted(normalized)
+        return cleaned
     except Exception as e:
         print("⚠️ load_markets:", e)
         return []
@@ -237,32 +256,79 @@ def generate_ai_summary(entries: list[str], timeframe: str) -> str:
     entries: list of textual lines (score reasons, price, var)
     timeframe: '4h'/'daily'/'weekly'
     """
+    # fallback if AI disabled or no key
     if not ENABLE_GROQ_AI or not GROQ_API_KEY:
-        # fallback: short heuristic summary
         topk = min(5, len(entries))
-        summary = f"Mini-analisi ({timeframe}): top {topk} coin selezionate dal report. Concentrati su breakout e compressioni."
-        return summary
-    # build prompt
+        return f"Mini-analisi ({timeframe}): top {topk} coin selezionate dal report. Concentrati su breakout e compressioni."
+
+    # guardrail: avoid ridiculously long prompts (trim entries if necessary)
+    max_entries_for_prompt = 40
+    safe_entries = entries[:max_entries_for_prompt]
+    if len(entries) > max_entries_for_prompt:
+        safe_entries.append(f"... e altri {len(entries)-max_entries_for_prompt} righe tagliate per brevità ...")
+
     prompt = (
         f"Sei un analista crypto breve. Ricevi {len(entries)} righe con coin, score e motivazioni.\n"
         f"Fornisci per il timeframe {timeframe} una mini-analisi (2-3 righe) e 1 breve 'fase operativa' (es. 'accumula', 'attendi rottura', 'vendi parzialmente').\n\n"
-        "Dati:\n" + "\n".join(entries) + "\n\nRisposta:\n"
+        "Dati:\n" + "\n".join(safe_entries) + "\n\nRisposta:"
     )
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {"prompt": prompt, "max_tokens": 220}
-        r = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=12)
-        if r.status_code == 200:
-            data = r.json()
-            # best-effort: accept text field or choices[0].text
-            text = data.get("text") or (data.get("choices") and data["choices"][0].get("text")) or str(data)
-            return text.strip()
-        else:
-            print("⚠️ GROQ API error:", r.status_code, r.text)
-            return "Mini-analisi non disponibile (errore AI)."
-    except Exception as e:
-        print("⚠️ GROQ request failed:", e)
-        return "Mini-analisi non disponibile (eccezione AI)."
+
+    # prepare OpenAI-compatible payload for Groq
+    payload = {
+        "model": os.getenv("GROQ_MODEL", "llama-3.1-70b-instant"),
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 220,
+        "temperature": 0.2
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # simple retry logic
+    tries = 0
+    while tries < 2:
+        tries += 1
+        try:
+            r = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                # parse a few possible shapes: choices[0].message.content OR choices[0].text OR text
+                text = None
+                if isinstance(data, dict):
+                    choices = data.get("choices")
+                    if choices and isinstance(choices, list) and len(choices) > 0:
+                        c0 = choices[0]
+                        # chat-style
+                        if isinstance(c0, dict) and c0.get("message") and isinstance(c0["message"], dict):
+                            text = c0["message"].get("content")
+                        # completion-style
+                        if not text and isinstance(c0, dict) and c0.get("text"):
+                            text = c0.get("text")
+                    # fallback top-level
+                    if not text and data.get("text"):
+                        text = data.get("text")
+                if not text:
+                    # unexpected shape
+                    print("⚠️ GROQ response parsing: unexpected shape:", data)
+                    return "Mini-analisi non disponibile (errore AI)."
+                return text.strip()
+            else:
+                print("⚠️ GROQ API error:", r.status_code, r.text)
+                # break early for 4xx (likely bad request)
+                if 400 <= r.status_code < 500:
+                    return "Mini-analisi non disponibile (errore AI)."
+        except Exception as e:
+            print("⚠️ GROQ request failed (attempt", tries, "):", e)
+            # on last try, return a clear message
+            if tries >= 2:
+                return "Mini-analisi non disponibile (eccezione AI)."
+            time.sleep(1.0)
+
+    return "Mini-analisi non disponibile (errore AI)."
 
 # -----------------------
 # Reports (wyckoff-like)
@@ -288,6 +354,7 @@ def build_report_for_timeframe(symbols: list[str], tf: str, tag: str):
                 if vt == "LOW" and diffpct < 0.5:
                     note = " — mercato in compressione, preparati per il breakout"
             reasons_text = "; ".join(reasons) if reasons else "-"
+            # format symbol consistently
             line = f"*{s}* | Score *{score}/100* | Prezzo {price:.6f} | Var {variation:+.2f}%{note} ▪ {reasons_text}"
             results.append((score, line))
     # sort by score desc and take top N
@@ -330,6 +397,9 @@ def monitor_loop():
 
     while True:
         cycle_start = time.time()
+        # re-load symbols periodically in case new markets appear (every large cycle)
+        # here we keep the same list to avoid frequent load_markets calls; if you want refresh, uncomment next line
+        # symbols = get_bybit_derivative_symbols()
         for s in symbols[:MAX_CANDIDATES_PER_CYCLE]:
             for tf in FAST_TFS + SLOW_TFS:
                 closes, vols = safe_fetch_ohlcv(s, tf, 120)
@@ -351,7 +421,8 @@ def monitor_loop():
                 # volume spike evaluation (optional)
                 vol_spike, vol_ratio = detect_volume_spike(vols, multiplier=VOLUME_SPIKE_MULTIPLIER)
                 usd_vol = 0.0
-                if "/USDT" in s or s.endswith(":USDT"):
+                # note: symbols were normalized to 'BASE/USDT' where applicable
+                if "/USDT" in s:
                     try:
                         usd_vol = price * vols[-1]
                     except Exception:
