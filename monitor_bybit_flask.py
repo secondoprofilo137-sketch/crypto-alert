@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # monitor_bybit_flask.py
 # Bybit monitor — alerts 1m/3m/1h + report 4h/daily/weekly with optional GROQ AI summaries
@@ -191,8 +192,32 @@ def score_signals(prices, volumes, variation):
 # Bybit helpers
 # -----------------------
 def safe_fetch_ohlcv(symbol, timeframe, limit=120):
+    """
+    Fetch OHLCV safely: first ensures markets are loaded and symbol exists in exchange.markets.
+    Returns (closes, vols) or (None, None) if symbol not available or fetch fails.
+    """
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        # ensure markets are loaded
+        if not getattr(exchange, "markets", None):
+            try:
+                exchange.load_markets()
+            except Exception as e:
+                print("⚠️ load_markets failed in safe_fetch_ohlcv:", e)
+                return None, None
+
+        # symbol must be in exchange.markets (ccxt canonical keys)
+        if symbol not in exchange.markets:
+            # try normalized variant (remove :USDT suffix)
+            alt = symbol.replace(":USDT", "")
+            if alt in exchange.markets:
+                symbol_to_fetch = alt
+            else:
+                print(f"⚠️ skip fetch {symbol} {timeframe}: symbol not in exchange.markets")
+                return None, None
+        else:
+            symbol_to_fetch = symbol
+
+        ohlcv = exchange.fetch_ohlcv(symbol_to_fetch, timeframe=timeframe, limit=limit)
         closes = [c[4] for c in ohlcv]
         vols = [c[5] for c in ohlcv]
         return closes, vols
@@ -202,38 +227,35 @@ def safe_fetch_ohlcv(symbol, timeframe, limit=120):
 
 def get_bybit_derivative_symbols():
     """
-    Load markets and return a cleaned, deduplicated list of derivatives/USDT-traded symbols.
-    Normalizza simboli del tipo 'LA/USDT:USDT' -> 'LA/USDT' e rimuove duplicati.
+    Load markets and return a cleaned, deduplicated list of perpetual (swap) USDT-traded symbols.
+    This filters out spot-only, dated futures, options and other non-swap markets.
     """
     try:
         markets = exchange.load_markets()
-        symbols = []
-        for s, info in markets.items():
-            t = info.get("type", "")
-            # prefer swap / linear / inverse markets
-            if t == "swap" or info.get("linear") or info.get("inverse"):
-                symbols.append(s)
-            # include spot-like USDT markets for consideration (ma escludi opzioni/future datati)
-            elif "/USDT" in s and "USDT-" not in s and "-C" not in s and "-P" not in s:
-                symbols.append(s)
-
-        # normalize and remove duplicates, prefer base format without ':USDT' suffix
-        normalized = set()
-        raw_set = set(symbols)
-        for s in raw_set:
-            if s.endswith(":USDT"):
-                base = s.replace(":USDT", "")
-                # prefer existing base if present; otherwise use base
-                if base in raw_set:
-                    continue
-                normalized.add(base)
-            else:
-                normalized.add(s)
-        cleaned = sorted(normalized)
-        return cleaned
     except Exception as e:
         print("⚠️ load_markets:", e)
         return []
+
+    valid_symbols = []
+    for m in markets.values():
+        # only perpetual swap markets
+        # ccxt market entry usually has 'type' == 'swap' for perpetuals
+        if m.get("type") != "swap":
+            continue
+        # require USDT quote
+        if m.get("quote") != "USDT":
+            continue
+        symbol = m.get("symbol")
+        if not symbol:
+            continue
+        # normalize suffixes like ':USDT'
+        clean = symbol.replace(":USDT", "")
+        if clean not in valid_symbols:
+            valid_symbols.append(clean)
+
+    valid_symbols = sorted(set(valid_symbols))
+    print(f"✅ Bybit: trovate {len(valid_symbols)} coppie USDT perpetual valide.")
+    return valid_symbols
 
 # -----------------------
 # Volume spike detector
