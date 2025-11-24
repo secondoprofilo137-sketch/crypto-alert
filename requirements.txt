@@ -5,3 +5,4 @@ matplotlib==3.8.1
 python-dotenv==1.0.1
 numpy
 fastdtw==0.3.4
+opencv-python
