@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # monitor_bybit_flask.py
 # Bybit monitor — ALERT PERCENTUALI + ASCENSIONI (Top 5 ogni 30m, messaggio unico dettagliato)
-
 from __future__ import annotations
 import os
 import time
@@ -13,11 +12,8 @@ import requests
 import ccxt
 import numpy as np
 from fastdtw import fastdtw
-import cv2
 
-# -----------------------
-# POLYFILL: euclidean distance for fastdtw
-# -----------------------
+# Polyfill euclidean for fastdtw
 def euclidean(a, b):
     return np.sqrt(np.sum((a - b) ** 2))
 
@@ -25,7 +21,6 @@ def euclidean(a, b):
 # LOAD ENV
 # -----------------------
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
 PORT = int(os.getenv("PORT", 10000))
@@ -44,30 +39,20 @@ THRESHOLDS = {
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 
-# -----------------------
 # ASCENSION SCANNER CONFIG
-# -----------------------
 ASC_SCAN_INTERVAL = int(os.getenv("ASC_SCAN_EVERY", 1800))
 ASC_TOP_N = int(os.getenv("ASC_TOP_N", 5))
 ASC_MAX_SYMBOLS = int(os.getenv("ASC_MAX_SYMBOLS", 200))
-ASC_PATTERN_IMAGE = os.getenv("PATTERN_IMAGE_PATH", "/mnt/data/1d39c56b-bbd0-4394-844d-00a9c355df5b.png")
 ASC_LOOKBACK_CANDLES = int(os.getenv("PATTERN_LOOKBACK_CANDLES", 48))
 WEIGHT_PEARSON = float(os.getenv("WEIGHT_PEARSON", 0.35))
 WEIGHT_COSINE = float(os.getenv("WEIGHT_COSINE", 0.35))
 WEIGHT_DTW = float(os.getenv("WEIGHT_DTW", 0.30))
 ASC_PER_SYMBOL_DELAY = float(os.getenv("ASC_PER_SYMBOL_DELAY", 0.08))
 
-# -----------------------
 # EXCHANGE
-# -----------------------
-exchange = ccxt.bybit({
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"}
-})
+exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
-# -----------------------
-# TELEGRAM HELPER
-# -----------------------
+# TELEGRAM
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_IDS:
         print("Telegram not configured. Message would be:\n", text)
@@ -84,65 +69,14 @@ def send_telegram(text: str):
         except Exception as e:
             print("Telegram send error:", e)
 
-# -----------------------
 # SAFE OHLCV FETCHER
-# -----------------------
 def safe_fetch_ohlcv(symbol: str, timeframe: str, limit: int = 200):
     try:
         return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
         return None
 
-# -----------------------
-# IMAGE -> SERIES
-# -----------------------
-def extract_vertical_profile(img_gray: np.ndarray):
-    h, w = img_gray.shape
-    profile = np.zeros(w, dtype=float)
-    _, th = cv2.threshold(img_gray, 200, 255, cv2.THRESH_BINARY_INV)
-    for col in range(w):
-        col_pixels = np.where(th[:, col] > 0)[0]
-        if col_pixels.size == 0:
-            profile[col] = np.nan
-        else:
-            profile[col] = h - np.mean(col_pixels)
-    nans = np.isnan(profile)
-    if nans.any():
-        xp = np.flatnonzero(~nans)
-        if xp.size >= 2:
-            profile[nans] = np.interp(np.flatnonzero(nans), xp, profile[~nans])
-        else:
-            profile[nans] = np.nanmean(profile[~nans]) if xp.size > 0 else 0.0
-    return profile
-
-def image_to_pattern_series(image_path: str, desired_candles: int = ASC_LOOKBACK_CANDLES) -> np.ndarray:
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Pattern image not found: {image_path}")
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = img_gray.shape
-    margin_w = int(w * 0.02)
-    margin_h = int(h * 0.12)
-    crop = img_gray[margin_h:h - margin_h, margin_w:w - margin_w]
-    profile = extract_vertical_profile(crop)
-    block_size = max(1, int(len(profile) / desired_candles))
-    vals = [np.nanmean(profile[i:i + block_size]) for i in range(0, len(profile), block_size)]
-    vals = np.array(vals, dtype=float)
-    if len(vals) < 6:
-        profile = extract_vertical_profile(img_gray)
-        block_size = max(1, int(len(profile) / desired_candles))
-        vals = [np.nanmean(profile[i:i + block_size]) for i in range(0, len(profile), block_size)]
-        vals = np.array(vals, dtype=float)
-    if np.nanstd(vals) == 0 or len(vals) < 6:
-        raise RuntimeError("Extracted pattern series invalid or too short")
-    vals = (vals - np.mean(vals)) / (np.std(vals) + 1e-12)
-    if len(vals) >= desired_candles:
-        vals = vals[-desired_candles:]
-    return vals
-
-# -----------------------
 # TIME-SERIES UTIL
-# -----------------------
 def series_from_ohlcv(ohlcv, lookback=ASC_LOOKBACK_CANDLES):
     closes = np.array([c[4] for c in ohlcv], dtype=float)
     if len(closes) < lookback:
@@ -157,9 +91,7 @@ def ensure_same_length(a: np.ndarray, b: np.ndarray):
     m = min(len(a), len(b))
     return a[-m:], b[-m:]
 
-# -----------------------
 # SIMILARITY METRICS
-# -----------------------
 def pearson_numpy(a: np.ndarray, b: np.ndarray):
     if a.size == 0 or b.size == 0:
         return 0.0
@@ -184,14 +116,24 @@ def compute_composite_score(a: np.ndarray, b: np.ndarray):
     return {"score": float(score), "pearson": float(p_mapped), "cosine": float(c_mapped), "dtw_sim": float(d_sim), "dtw_dist": float(d_dist)}
 
 # -----------------------
-# ASCENSION SCAN
+# REFERENCE SERIES (senza immagine)
 # -----------------------
+def get_reference_series(symbol="BTC/USDT", timeframe="15m", lookback=ASC_LOOKBACK_CANDLES):
+    ohlcv = safe_fetch_ohlcv(symbol, timeframe, limit=lookback+1)
+    if not ohlcv:
+        return None
+    closes = np.array([c[4] for c in ohlcv], dtype=float)
+    lr = np.diff(np.log(closes + 1e-12))
+    if np.std(lr) == 0:
+        return None
+    return (lr - np.mean(lr)) / (np.std(lr) + 1e-12)
+
+# ASCENSION SCAN
 def run_ascension_scan_once():
     try:
-        ref_vals = image_to_pattern_series(ASC_PATTERN_IMAGE, ASC_LOOKBACK_CANDLES)
-        ref_series = np.diff(ref_vals)
-        if np.std(ref_series) == 0:
-            print("Ref series flat — abort asc scan")
+        ref_series = get_reference_series("BTC/USDT", "15m", ASC_LOOKBACK_CANDLES)
+        if ref_series is None:
+            print("Cannot get reference series — abort asc scan")
             return []
         markets = exchange.load_markets()
         symbols = [s for s in markets.keys() if s.endswith("/USDT")][:ASC_MAX_SYMBOLS]
@@ -242,9 +184,7 @@ def ascension_scan_loop():
         to_sleep = max(1, ASC_SCAN_INTERVAL - elapsed)
         time.sleep(to_sleep)
 
-# -----------------------
 # PERCENT-CHANGE MONITOR LOOP
-# -----------------------
 last_prices = {}
 last_alert_time = {}
 last_hb = 0
@@ -289,11 +229,8 @@ def monitor_loop():
             last_hb = now
         time.sleep(LOOP_DELAY)
 
-# -----------------------
 # FLASK + THREAD START
-# -----------------------
 app = Flask(__name__)
-
 @app.route("/")
 def home():
     return "Crypto Alert Bot — Running"
