@@ -1,64 +1,67 @@
 #!/usr/bin/env python3
 # monitor_bybit_flask.py
-# Bybit monitor — ALERT PERCENTUALI + ASCENSIONI (Top 5 ogni 30m, messaggio unico dettagliato)
+# Bybit: Percent-change monitor + ASCENSORE SAFE (perpetual only)
+
 from __future__ import annotations
 import os
 import time
 import threading
+import math
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask
 import requests
 import ccxt
 import numpy as np
-from fastdtw import fastdtw
 
-# Polyfill euclidean for fastdtw
-def euclidean(a, b):
-    return np.sqrt(np.sum((a - b) ** 2))
-
-# -----------------------
-# LOAD ENV
-# -----------------------
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_IDS = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
-PORT = int(os.getenv("PORT", 10000))
 
+# -------------------------
+# CONFIG (env-friendly)
+# -------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+
+PORT = int(os.getenv("PORT", "10000"))
+
+# Percent-change monitor
 FAST_TFS = os.getenv("FAST_TFS", "1m,3m").split(",")
 SLOW_TFS = os.getenv("SLOW_TFS", "1h").split(",")
-LOOP_DELAY = int(os.getenv("LOOP_DELAY", 10))
-MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", 1000))
+LOOP_DELAY = int(os.getenv("LOOP_DELAY", "10"))           # seconds between cycles
+MAX_CANDIDATES_PER_CYCLE = int(os.getenv("MAX_CANDIDATES_PER_CYCLE", "1000"))
+THRESH_1M = float(os.getenv("THRESH_1M", "7.5"))
+THRESH_3M = float(os.getenv("THRESH_3M", "11.5"))
+THRESH_1H = float(os.getenv("THRESH_1H", "17.0"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180"))
 
-THRESHOLDS = {
-    "1m": float(os.getenv("THRESH_1M", 7.5)),
-    "3m": float(os.getenv("THRESH_3M", 11.5)),
-    "1h": float(os.getenv("THRESH_1H", 17.0)),
-}
+# ASCENSORE SAFE params (preset SAFE)
+ASC_MIN_SPIKE_PCT = float(os.getenv("ASC_MIN_SPIKE_PCT", "2.0"))      # ±% in 1m
+ASC_MIN_VOLUME_USD = float(os.getenv("ASC_MIN_VOLUME_USD", "150000"))# $ volume min in last 1m
+ASC_MIN_LIQUIDITY_DEPTH = float(os.getenv("ASC_MIN_LIQUIDITY_DEPTH", "80000")) # $ depth around mid
+ASC_DELTA_MIN = float(os.getenv("ASC_DELTA_MIN", "20000"))          # $ buy-sell or sell-buy required
+ASC_COOLDOWN = int(os.getenv("ASC_COOLDOWN", "600"))               # seconds cooldown per symbol
+ASC_PER_SYMBOL_DELAY = float(os.getenv("ASC_PER_SYMBOL_DELAY", "0.05"))  # polite delay
 
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
 
-# ASCENSION SCANNER CONFIG
-ASC_SCAN_INTERVAL = int(os.getenv("ASC_SCAN_EVERY", 1800))
-ASC_TOP_N = int(os.getenv("ASC_TOP_N", 5))
-ASC_MAX_SYMBOLS = int(os.getenv("ASC_MAX_SYMBOLS", 200))
-ASC_LOOKBACK_CANDLES = int(os.getenv("PATTERN_LOOKBACK_CANDLES", 48))
-WEIGHT_PEARSON = float(os.getenv("WEIGHT_PEARSON", 0.35))
-WEIGHT_COSINE = float(os.getenv("WEIGHT_COSINE", 0.35))
-WEIGHT_DTW = float(os.getenv("WEIGHT_DTW", 0.30))
-ASC_PER_SYMBOL_DELAY = float(os.getenv("ASC_PER_SYMBOL_DELAY", 0.08))
-
+# -------------------------
 # EXCHANGE
-exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+# -------------------------
+exchange = ccxt.bybit({
+    "enableRateLimit": True,
+    "options": {"defaultType": "swap"}
+})
 
+# -------------------------
 # TELEGRAM
+# -------------------------
 def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not CHAT_IDS:
-        print("Telegram not configured. Message would be:\n", text)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+        # print to logs if not configured
+        print("Telegram not configured — would send:\n", text)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for cid in CHAT_IDS:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for cid in TELEGRAM_CHAT_IDS:
         try:
             requests.post(url, data={
                 "chat_id": cid,
@@ -69,168 +72,235 @@ def send_telegram(text: str):
         except Exception as e:
             print("Telegram send error:", e)
 
-# SAFE OHLCV FETCHER
+# -------------------------
+# UTIL: symbols (perpetual only)
+# -------------------------
+def get_perpetual_symbols():
+    try:
+        markets = exchange.load_markets()
+        syms = []
+        for s, m in markets.items():
+            # ccxt bybit market object keys vary; use type == 'swap' and settle == 'USDT' if present
+            t = m.get("type") or m.get("contract") or ""
+            settle = m.get("settle") or m.get("settlement") or m.get("settle_currency") or ""
+            # safe check: symbol endswith /USDT is common
+            if m.get("symbol", "").endswith("/USDT") and (m.get("type") == "swap" or m.get("future") is None):
+                syms.append(m["symbol"])
+        syms = sorted(list(set(syms)))
+        return syms
+    except Exception as e:
+        print("Error loading markets:", e)
+        return []
+
+# -------------------------
+# SAFE OHLCV fetcher
+# -------------------------
 def safe_fetch_ohlcv(symbol: str, timeframe: str, limit: int = 200):
     try:
         return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception:
-        return None
-
-# TIME-SERIES UTIL
-def series_from_ohlcv(ohlcv, lookback=ASC_LOOKBACK_CANDLES):
-    closes = np.array([c[4] for c in ohlcv], dtype=float)
-    if len(closes) < lookback:
-        return None
-    closes = closes[-lookback:]
-    lr = np.diff(np.log(closes + 1e-12))
-    if np.std(lr) == 0:
-        return None
-    return (lr - np.mean(lr)) / (np.std(lr) + 1e-12)
-
-def ensure_same_length(a: np.ndarray, b: np.ndarray):
-    m = min(len(a), len(b))
-    return a[-m:], b[-m:]
-
-# SIMILARITY METRICS
-def pearson_numpy(a: np.ndarray, b: np.ndarray):
-    if a.size == 0 or b.size == 0:
-        return 0.0
-    a_mean, b_mean = a.mean(), b.mean()
-    num = ((a - a_mean) * (b - b_mean)).sum()
-    den = np.sqrt(((a - a_mean) ** 2).sum() * ((b - b_mean) ** 2).sum())
-    return float(num / (den + 1e-12))
-
-def cosine_numpy(a: np.ndarray, b: np.ndarray):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
-
-def dtw_similarity(a: np.ndarray, b: np.ndarray):
-    dist, _ = fastdtw(a, b, dist=euclidean)
-    return 1.0 / (1.0 + dist), float(dist)
-
-def compute_composite_score(a: np.ndarray, b: np.ndarray):
-    p_mapped = (pearson_numpy(a, b) + 1.0) / 2.0
-    c_mapped = (cosine_numpy(a, b) + 1.0) / 2.0
-    d_sim, d_dist = dtw_similarity(a, b)
-    score = WEIGHT_PEARSON * p_mapped + WEIGHT_COSINE * c_mapped + WEIGHT_DTW * d_sim
-    return {"score": float(score), "pearson": float(p_mapped), "cosine": float(c_mapped), "dtw_sim": float(d_sim), "dtw_dist": float(d_dist)}
-
-# -----------------------
-# REFERENCE SERIES (senza immagine)
-# -----------------------
-def get_reference_series(symbol="BTC/USDT", timeframe="15m", lookback=ASC_LOOKBACK_CANDLES):
-    ohlcv = safe_fetch_ohlcv(symbol, timeframe, limit=lookback+1)
-    if not ohlcv:
-        return None
-    closes = np.array([c[4] for c in ohlcv], dtype=float)
-    lr = np.diff(np.log(closes + 1e-12))
-    if np.std(lr) == 0:
-        return None
-    return (lr - np.mean(lr)) / (np.std(lr) + 1e-12)
-
-# ASCENSION SCAN
-def run_ascension_scan_once():
-    try:
-        ref_series = get_reference_series("BTC/USDT", "15m", ASC_LOOKBACK_CANDLES)
-        if ref_series is None:
-            print("Cannot get reference series — abort asc scan")
-            return []
-        markets = exchange.load_markets()
-        symbols = [s for s in markets.keys() if s.endswith("/USDT")][:ASC_MAX_SYMBOLS]
-        results = []
-        for sym in symbols:
-            try:
-                ohlcv = safe_fetch_ohlcv(sym, "15m", limit=ASC_LOOKBACK_CANDLES)
-                if not ohlcv:
-                    continue
-                other = series_from_ohlcv(ohlcv, ASC_LOOKBACK_CANDLES)
-                if other is None:
-                    continue
-                a, b = ensure_same_length(ref_series, other)
-                mets = compute_composite_score(a, b)
-                closes = np.array([c[4] for c in ohlcv], dtype=float)
-                vols = np.array([c[5] for c in ohlcv], dtype=float) if len(ohlcv[0]) > 5 else np.array([0.0])
-                pct15 = (closes[-1] - closes[-2]) / (closes[-2] + 1e-12) * 100 if len(closes) >= 2 else 0.0
-                last_vol = float(vols[-1]) if vols.size > 0 else 0.0
-                results.append({"symbol": sym, "score": mets["score"], "pearson": mets["pearson"],
-                                "cosine": mets["cosine"], "dtw_sim": mets["dtw_sim"], "dtw_dist": mets["dtw_dist"],
-                                "pct15": float(pct15), "vol": last_vol})
-            except Exception:
-                pass
-            time.sleep(ASC_PER_SYMBOL_DELAY)
-        return sorted(results, key=lambda x: x["score"], reverse=True)
     except Exception as e:
-        print("Error in run_ascension_scan_once:", e)
-        return []
+        # don't crash on single fetch
+        # print(f"fetch_ohlcv error {symbol} {timeframe}: {e}")
+        return None
 
-def ascension_scan_loop():
-    time.sleep(5)
-    while True:
-        start_t = time.time()
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Starting ascension scan...")
-        results = run_ascension_scan_once()
-        if results:
-            top = results[:ASC_TOP_N]
-            nowtxt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            lines = [f"📊 *Top {len(top)} Ascensioni (15m)* — {nowtxt}\n"]
-            for i, r in enumerate(top, start=1):
-                vol_fmt = f"{r['vol']:.0f}" if r['vol'] >= 1000 else f"{r['vol']:.2f}"
-                lines.append(f"{i}) *{r['symbol']}*\n   • Score: {r['score']:.3f}\n   • Variazione 15m: {r['pct15']:+.2f}%\n   • Volumi (last 15m): {vol_fmt}\n")
-            send_telegram("\n".join(lines))
-            print(f"[{datetime.now(timezone.utc).isoformat()}] Ascension scan finished. Sent top {len(top)}.")
-        else:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] Ascension scan: no results.")
-        elapsed = time.time() - start_t
-        to_sleep = max(1, ASC_SCAN_INTERVAL - elapsed)
-        time.sleep(to_sleep)
-
-# PERCENT-CHANGE MONITOR LOOP
+# -------------------------
+# PERCENT-CHANGE MONITOR (lightweight)
+# -------------------------
 last_prices = {}
 last_alert_time = {}
 last_hb = 0
 
-def monitor_loop():
+TF_THRESH = {
+    "1m": THRESH_1M,
+    "3m": THRESH_3M,
+    "1h": THRESH_1H
+}
+
+def percent_monitor_loop():
     global last_hb
-    symbols = []
-    try:
-        symbols = exchange.load_markets().keys()
-        symbols = [s for s in symbols if s.endswith("/USDT")]
-        symbols = sorted(symbols)
-        print(f"Loaded {len(symbols)} symbols for percent alerts")
-    except Exception as e:
-        print("Error loading markets in monitor_loop:", e)
+    symbols = get_perpetual_symbols()
+    print(f"[percent] Loaded {len(symbols)} perpetual symbols")
     while True:
         for s in list(symbols)[:MAX_CANDIDATES_PER_CYCLE]:
             for tf in (FAST_TFS + SLOW_TFS):
                 ohlcv = safe_fetch_ohlcv(s, tf, limit=3)
-                if not ohlcv:
+                if not ohlcv or len(ohlcv) < 2:
                     continue
-                price = ohlcv[-1][4]
+                price = float(ohlcv[-1][4])
                 key = f"{s}_{tf}"
                 if key not in last_prices:
                     last_prices[key] = price
                     continue
                 prev = last_prices[key]
                 variation = ((price - prev) / (prev + 1e-12)) * 100
-                threshold = THRESHOLDS.get(tf, 999)
+                threshold = TF_THRESH.get(tf, 999)
                 if abs(variation) >= threshold:
                     nowt = time.time()
                     last_ts = last_alert_time.get(key, 0)
                     if nowt - last_ts >= COOLDOWN_SECONDS:
                         direction = "📈 Rialzo" if variation > 0 else "📉 Ribasso"
                         nowtxt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                        msg = f"🔔 *ALERT* — {s} ({tf})\nVariazione: {variation:+.2f}%\nPrezzo: {price:.6f}\n{direction}\n[{nowtxt}]"
+                        msg = (
+                            f"🔔 *ALERT* — {s} ({tf})\n"
+                            f"Variazione: {variation:+.2f}%\n"
+                            f"Prezzo: {price:.6f}\n"
+                            f"{direction}\n"
+                            f"[{nowtxt}]"
+                        )
                         send_telegram(msg)
                         last_alert_time[key] = nowt
                 last_prices[key] = price
+
+        # heartbeat
         now = time.time()
         if now - last_hb >= HEARTBEAT_INTERVAL:
             send_telegram("💓 Heartbeat — bot attivo")
             last_hb = now
+
         time.sleep(LOOP_DELAY)
 
+# -------------------------
+# ASCENSORE SAFE MODULE
+# -------------------------
+asc_last_alert = {}  # per-symbol cooldown
+
+def compute_spike_and_volume_usd(symbol: str):
+    """Return (spike_pct, volume_usd, last_close, prev_close) or None on error"""
+    ohlcv = safe_fetch_ohlcv(symbol, "1m", limit=2)
+    if not ohlcv or len(ohlcv) < 2:
+        return None
+    prev = float(ohlcv[-2][4])
+    last = float(ohlcv[-1][4])
+    volume = float(ohlcv[-1][5])  # volume in base asset
+    vol_usd = volume * last
+    if prev == 0:
+        return None
+    spike = ((last - prev) / prev) * 100
+    return spike, vol_usd, last, prev
+
+def compute_orderbook_depth(symbol: str, pct_window: float = 0.003, levels: int = 10):
+    """Sum price*amount for bids within mid*(1-pct_window) and asks within mid*(1+pct_window)"""
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=levels)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return 0.0
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
+        mid = (best_bid + best_ask) / 2.0
+        low_thr = mid * (1 - pct_window)
+        high_thr = mid * (1 + pct_window)
+        depth_buy = sum((price * amount) for price, amount in bids if price >= low_thr)
+        depth_sell = sum((price * amount) for price, amount in asks if price <= high_thr)
+        return float(depth_buy + depth_sell)
+    except Exception as e:
+        # print("orderbook error", e)
+        return 0.0
+
+def compute_trade_delta(symbol: str, limit: int = 200):
+    """Fetch recent trades and return (buy_usd, sell_usd)"""
+    try:
+        trades = exchange.fetch_trades(symbol, limit=limit)
+        buy = 0.0
+        sell = 0.0
+        for tr in trades:
+            price = float(tr.get("price", 0.0))
+            amount = float(tr.get("amount", 0.0))
+            side = tr.get("side", "").lower()
+            val = price * amount
+            if side == "buy":
+                buy += val
+            elif side == "sell":
+                sell += val
+        return buy, sell
+    except Exception as e:
+        # print("fetch_trades error", e)
+        return 0.0, 0.0
+
+def ascensore_safe_check_symbol(symbol: str):
+    """Return message string if alert should be emitted, else None"""
+    try:
+        # cooldown per symbol
+        now = time.time()
+        if symbol in asc_last_alert and now - asc_last_alert[symbol] < ASC_COOLDOWN:
+            return None
+
+        # 1) spike + volume
+        sv = compute_spike_and_volume_usd(symbol)
+        if not sv:
+            return None
+        spike_pct, vol_usd, last_price, prev_price = sv
+
+        if abs(spike_pct) < ASC_MIN_SPIKE_PCT:
+            return None
+        if vol_usd < ASC_MIN_VOLUME_USD:
+            return None
+
+        # 2) liquidity depth check
+        depth = compute_orderbook_depth(symbol, pct_window=0.003, levels=20)
+        if depth < ASC_MIN_LIQUIDITY_DEPTH:
+            return None
+
+        # 3) trades delta (aggressive orders)
+        buy_usd, sell_usd = compute_trade_delta(symbol, limit=200)
+        delta = buy_usd - sell_usd
+
+        # require delta direction aligned with spike, with threshold
+        if spike_pct > 0:
+            if delta < ASC_DELTA_MIN:
+                return None
+            direction = "LONG"
+        else:
+            if -delta < ASC_DELTA_MIN:
+                return None
+            direction = "SHORT"
+
+        # passed all filters -> alert
+        asc_last_alert[symbol] = now
+
+        # details
+        vol_fmt = f"${vol_usd:,.0f}"
+        depth_fmt = f"${depth:,.0f}"
+        delta_fmt = f"${delta:,.0f}"
+        spike_str = f"{spike_pct:+.2f}% in 1m"
+
+        msg = (
+            f"🚨 *ASCENSORE SAFE — SPIKE CONFERMATO*\n"
+            f"*{symbol}* — {direction}\n"
+            f"{spike_str}\n\n"
+            f"• Volume 1m: {vol_fmt}\n"
+            f"• Liquidity (±0.3%): {depth_fmt}\n"
+            f"• Delta (buy - sell recent): {delta_fmt}\n"
+            f"• Prezzo: {last_price:.6f}\n"
+            f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}]"
+        )
+        return msg
+    except Exception as e:
+        # print("asc check error", e)
+        return None
+
+def ascensore_safe_loop():
+    print("ASCENSORE SAFE loop started...")
+    symbols = get_perpetual_symbols()
+    print(f"[ascensore] monitoring {len(symbols)} perpetual symbols")
+    while True:
+        try:
+            for sym in symbols:
+                res = ascensore_safe_check_symbol(sym)
+                if res:
+                    print("[ascensore] alert:", sym)
+                    send_telegram(res)
+                time.sleep(ASC_PER_SYMBOL_DELAY)
+        except Exception as e:
+            print("[ascensore] loop error:", e)
+            time.sleep(2)
+
+# -------------------------
 # FLASK + THREAD START
+# -------------------------
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "Crypto Alert Bot — Running"
@@ -240,13 +310,12 @@ def test():
     send_telegram("🧪 Test OK")
     return "Test sent", 200
 
+def start_threads():
+    threading.Thread(target=percent_monitor_loop, daemon=True).start()
+    threading.Thread(target=ascensore_safe_loop, daemon=True).start()
+
 if __name__ == "__main__":
-    print("🚀 Starting monitor_bybit_flask with Ascension scanner (Top 5 every 30m)...")
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    threading.Thread(target=ascension_scan_loop, daemon=True).start()
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        print("Exiting...")
+    print("🚀 Starting Crypto Alert Bot (percent monitor + ASCENSORE SAFE)...")
+    start_threads()
+    # start flask (development server is acceptable on Render with web process)
+    app.run(host="0.0.0.0", port=PORT)
